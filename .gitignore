@@ -39,3 +39,7 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# T01 audit report artifact (local only)
+.t01-theme-audit.json
+.t01-backfill-simulation.json

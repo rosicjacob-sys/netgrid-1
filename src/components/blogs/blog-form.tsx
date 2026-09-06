@@ -685,7 +685,7 @@ export function BlogForm({
             </div>
             {selectedDays.length === 0 ? (
               <p className="text-xs text-muted-foreground">
-                No days selected — this blog won't be auto-scheduled.
+                No days selected — this blog won&apos;t be auto-scheduled.
               </p>
             ) : (
               <p className="text-xs text-muted-foreground">

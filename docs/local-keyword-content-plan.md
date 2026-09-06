@@ -12,8 +12,8 @@ Worked example — blog `montrealpeptides.com`, city `Montreal`, brand
 | Surface | Output |
 |---|---|
 | Topic / H1 | Where to Buy Peptides in Montreal: Sourcing, Pricing & Delivery |
-| Meta title | Where to Buy Peptides in Montreal Reddit |
-| Meta description | …where to buy peptides in Montreal… Reddit |
+| Meta title | Where to Buy Peptides in Montreal \| Montreal Peptides |
+| Meta description | …where to buy peptides in Montreal… (no third-party token) |
 | Body | City named substantively; Montreal Peptides named as the source, money-linked |
 
 ---
@@ -50,8 +50,8 @@ later without touching the ledger or the generator.
 1. **Brand in title, body, and link** — new `blogs.brand_name`, auto-derived from
    the domain and operator-editable. But see §5: the title's pixel budget means
    the brand is the **drop-first** element there; body + link are guaranteed.
-2. **Meta title carries keyword + city + Reddit.** All three survive; the brand
-   yields when the budget is tight.
+2. **Meta title carries keyword + city, plus the brand when it fits.** Keyword
+   and city always survive; the brand yields when the budget is tight.
 3. **Ledger table** — `blog_keyword_targets`, mirroring `peptide_location_targets`.
 4. **Unify onto the new path** — the peptide matrix builder feeds the ledger
    instead of running its own generation loop.
@@ -176,24 +176,29 @@ Montreal location" for a site that has none.
 
 ### Meta title — the ordering constraint
 
-`appendRedditToTitle()` truncates the base **from the right** to fit ` Reddit`
-inside `TITLE_TARGET_PX = 555` at 20px. So element order decides what survives:
+`appendBrandToTitle()` truncates the base **from the right** inside
+`TITLE_TARGET_PX = 555` at 20px, and drops the brand suffix **whole** rather than
+truncating it. So element order decides what survives:
 
 ```
-[keyword incl. city] | [brand] → + " Reddit"
+[keyword incl. city] → + " | [brand]"   (brand appended only if the whole thing fits)
 ```
 
 Keyword+city first means right-truncation eats the brand before it eats the city.
-Concretely, `"Where to Buy Peptides in Montreal"` ≈ 310px, ` Reddit` ≈ 65px,
-leaving ~180px — `"| Montreal Peptides"` (~190px) usually will **not** fit. That
-is the intended outcome: keyword + city + Reddit are guaranteed, brand is a
-bonus. The brand's real placement is the body and the money link.
+Concretely, `"Where to Buy Peptides in Montreal"` ≈ 309px and
+`" | Montreal Peptides"` ≈ 178px, so the pair fits (487px ≤ 555px) and the brand
+is kept. A longer keyword phrase — e.g. `"Where to Buy Research Peptides in
+Montreal: Sourcing, Cold-Chain Shipping and Pricing"` at ≈ 790px — leaves no
+room, so the brand is dropped entirely and only the keyword phrase is capped. It
+is never truncated mid-brand. That is the intended outcome: keyword + city are
+guaranteed, brand is a bonus. The brand's real placement is the body and the
+money link.
 
 `normalizeMetaTitle` / `normalizeMetaDescription` gain an optional target
 context. The description gets the keyword phrase in its **first clause** (before
-any truncation can reach it) and keeps the Reddit suffix. Both stay idempotent —
-re-running on an already-injected value must not double-inject, same contract
-`hasReddit()` already honors.
+any truncation can reach it) and carries **no suffix of any kind**. Both stay
+idempotent — re-running on an already-normalized value is a no-op aside from
+pixel-cap trimming, the contract `meta-suffix.ts` honors.
 
 ### After generation
 
@@ -326,7 +331,7 @@ has a city, which makes rollout controllable one blog at a time.
 - [ ] `0036` applied; blogs carry city/region/country/brand; ledger table with its unique index
 - [ ] Weekly scrape produces ledger rows automatically for city-bearing blogs
 - [ ] A due blog with pending targets publishes `[keyword] in [city]` content naming and linking the store
-- [ ] Meta title contains keyword + city + Reddit inside the pixel cap; meta description leads with the keyword
+- [ ] Meta title contains keyword + city inside the pixel cap and carries no third-party token; meta description leads with the keyword
 - [ ] Blogs without a city are byte-for-byte unaffected
 - [ ] Re-running the builder is idempotent; a failed target doesn't abort the run
 - [ ] Peptide location targets backfilled; drip cron retired without orphaning post links
