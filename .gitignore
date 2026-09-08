@@ -43,3 +43,9 @@ next-env.d.ts
 # T01 audit report artifact (local only)
 .t01-theme-audit.json
 .t01-backfill-simulation.json
+.t02-sweep-progress.json
+.t02-sweep-stdout.log
+.t02-sweep-complete
+.t02-sweep-loop.log
+.t02-sweep-loop-err.log
+.t02-sweep-stderr.log
