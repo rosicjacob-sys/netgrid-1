@@ -10,11 +10,25 @@ import { effectiveCtaDestination } from "@/lib/content/cta-target";
 import { recordPipelineError } from "@/lib/services/run-telemetry";
 
 /**
- * Netgrid-hosted link tracking for published posts. CTA buttons point at
- * /r/{postId} (logs a click, then 302s to the client's real CTA URL); each post
- * body carries a 1x1 pixel at /api/track/px/{postId} (logs a page view). Both
- * need netgrid's PUBLIC origin, since the markup renders on external Shopify/WP
- * sites — set NEXT_PUBLIC_APP_URL to the production host.
+ * LEGACY netgrid-hosted link tracking. RETIRED by T02 — do not add callers.
+ *
+ * Published posts used to embed a 1x1 pixel at /api/track/px/{postId} and route
+ * their CTA through /r/{postId}. Both put ONE shared host into the HTML of
+ * every site in the network, which is the strongest footprint a private blog
+ * network can emit. New posts link directly to the client with UTM parameters
+ * (see src/lib/content/outbound-links.ts).
+ *
+ * What survives here and why:
+ *   - getAppBaseUrl        — still used for the in-post registration form's
+ *                            action URL (/api/register/{blogId}).
+ *   - ctaRedirectUrl,
+ *     blogCtaRedirectUrl   — the reverse backfill rebuilds the OLD href so it
+ *                            can find and repoint it. Not emitted into any new
+ *                            markup.
+ *   - logLinkEvent + the resolvers — the /r and /api/track routes stay live so
+ *                            links on posts not yet repaired still land on the
+ *                            client instead of 404ing. Delete once the counting
+ *                            SQL in T02 §6 reports zero affected posts.
  */
 
 export function getAppBaseUrl(): string {
@@ -25,42 +39,6 @@ export function getAppBaseUrl(): string {
 
 export function ctaRedirectUrl(postId: string): string {
   return `${getAppBaseUrl()}/r/${postId}`;
-}
-
-export function trackingPixelUrl(postId: string): string {
-  return `${getAppBaseUrl()}/api/track/px/${postId}`;
-}
-
-/** Hidden tracking-pixel <img> appended to a published post body. */
-export function trackingPixelImg(postId: string): string {
-  return (
-    `<img src="${trackingPixelUrl(postId)}" width="1" height="1" ` +
-    `alt="" aria-hidden="true" style="position:absolute;width:1px;height:1px;` +
-    `opacity:0;pointer-events:none;" />`
-  );
-}
-
-/**
- * Blog-level (site-wide) page-view pixel. Logs a view keyed to the blog with no
- * postId — used for the homepage and other non-article pages, where there is no
- * per-post body pixel. Injected into the Shopify theme <head> (see
- * shopify-theme-client) so it fires on every page load of the store.
- */
-export function blogTrackingPixelUrl(blogId: string): string {
-  return `${getAppBaseUrl()}/api/track/px/blog/${blogId}`;
-}
-
-/**
- * Hidden blog-level tracking-pixel <img>. Used when embedding into page BODY
- * content (e.g. a WordPress static homepage), where an <img> renders — unlike
- * the Shopify <head> beacon, which is script-based.
- */
-export function blogTrackingPixelImg(blogId: string): string {
-  return (
-    `<img src="${blogTrackingPixelUrl(blogId)}" width="1" height="1" ` +
-    `alt="" aria-hidden="true" style="position:absolute;width:1px;height:1px;` +
-    `opacity:0;pointer-events:none;" />`
-  );
 }
 
 /**

@@ -1184,6 +1184,8 @@ export async function generateBlogPost(
     styleProfile: styleProfile ?? undefined,
     verticalKey: verticalForPost?.key ?? null,
     language: postLanguage,
+    // utm_source for the direct CTA / money links (T02).
+    blogDomain: blog.domain,
     // blogs.brand_name verbatim — the local `brandName` const above falls back
     // to deriveBrandName() and must not reach the title tag.
     brandName: blog.brandName,

@@ -27,8 +27,9 @@ import {
 
 const THEME_TIMEOUT_MS = 20000;
 
-/** Bump when the injected block changes so existing stores get re-patched. */
-export const SEO_BLOCK_VERSION = 2;
+// v3 (T02): removed the site-wide page-view beacon and the CTA-rewriting
+// script. Both pointed every storefront page at one shared netgrid host.
+export const SEO_BLOCK_VERSION = 3;
 const MARKER_BEGIN = `{%- comment -%} BEGIN netgrid-seo v${SEO_BLOCK_VERSION} — managed by netgrid; do not edit {%- endcomment -%}`;
 const MARKER_END = `{%- comment -%} END netgrid-seo v${SEO_BLOCK_VERSION} {%- endcomment -%}`;
 // Matches any prior version's block so an upgrade replaces it instead of
@@ -65,22 +66,6 @@ export interface SeoBlockOptions {
    * theme's existing tag instead, to avoid a duplicate description meta.
    */
   includeDescription?: boolean;
-  /**
-   * netgrid blog-level tracking-pixel URL (see link-tracker.blogTrackingPixelUrl).
-   * When set, a page-view beacon fires on every NON-article page (homepage,
-   * collections, pages, ...). Article pages carry the per-post body pixel, so
-   * excluding them here keeps views from being double-counted.
-   */
-  trackingPixelUrl?: string;
-  /**
-   * The client's CTA URL and the blog-level tracked redirect
-   * (link-tracker.blogCtaRedirectUrl). When both are set, a small site-wide
-   * script repoints any `<a>` pointing at the CTA URL to the redirect, so CTA
-   * clicks on the homepage / non-post pages are logged. Post CTAs already go
-   * through /r/{postId}, so they don't match the raw CTA URL and are untouched.
-   */
-  ctaUrl?: string;
-  ctaRedirectUrl?: string;
 }
 
 /**
@@ -88,6 +73,11 @@ export interface SeoBlockOptions {
  * (when enabled) render site-wide; the OG / JSON-LD section is guarded to
  * article pages. Safe to live anywhere inside <head> (meta-tags.liquid already
  * runs there).
+ *
+ * T02: the block no longer contains the site-wide page-view beacon or the
+ * CTA-rewriting script — both pointed every storefront page at one shared
+ * netgrid host. Existing stores are upgraded by re-running applyThemeSeoFix /
+ * optimizeThemeSeo (SEO_BLOCK_VERSION bump).
  */
 export function buildSeoMetaBlock(opts: SeoBlockOptions = {}): string {
   const faviconLine = opts.includeFavicon
@@ -103,30 +93,7 @@ export function buildSeoMetaBlock(opts: SeoBlockOptions = {}): string {
   <meta name="description" content="{{ page_description | strip_html | truncate: 150 | escape }}">
 {%- endif -%}`
     : "";
-  // Site-wide page-view beacon, fired on every page EXCEPT articles (those
-  // carry the per-post body pixel). new Image() so it works from <head>; the
-  // cache-buster forces a request on each navigation.
-  const trackingLine = opts.trackingPixelUrl
-    ? `
-{%- unless request.page_type == 'article' -%}
-  <script>(function(){try{(new Image()).src=${JSON.stringify(
-    opts.trackingPixelUrl,
-  )}+"?t="+Date.now();}catch(e){}})();</script>
-{%- endunless -%}`
-    : "";
-  // Site-wide CTA click tracking: repoint any link whose href is the client's
-  // CTA URL to the tracked redirect. Runs on all pages; post CTAs already use
-  // /r/{postId} so they don't match and are left alone.
-  const ctaLine =
-    opts.ctaUrl && opts.ctaRedirectUrl
-      ? `
-  <script>(function(){try{var t=${JSON.stringify(
-    opts.ctaUrl,
-  )},r=${JSON.stringify(
-          opts.ctaRedirectUrl,
-        )};if(!t||!r)return;var f=function(){var a=document.querySelectorAll('a[href]');for(var i=0;i<a.length;i++){if(a[i].getAttribute('href')===t||a[i].href===t){a[i].setAttribute('href',r);}}};if(document.readyState!=='loading'){f();}else{document.addEventListener('DOMContentLoaded',f);}}catch(e){}})();</script>`
-      : "";
-  return `${MARKER_BEGIN}${faviconLine}${descriptionLine}${trackingLine}${ctaLine}
+  return `${MARKER_BEGIN}${faviconLine}${descriptionLine}
 {%- if request.page_type == 'article' and article -%}
   {%- if article.published_at -%}
     <meta property="article:published_time" content="{{ article.published_at | date: '%Y-%m-%dT%H:%M:%SZ' }}">
@@ -271,9 +238,6 @@ export interface ThemeSeoResult {
 export async function injectSeoMetaTags(
   creds: ShopifyCreds,
   apiVersion: string = DEFAULT_API_VERSION,
-  trackingPixelUrl?: string,
-  ctaUrl?: string,
-  ctaRedirectUrl?: string,
 ): Promise<ThemeSeoResult> {
   try {
     const client = await createClient(creds, apiVersion, THEME_TIMEOUT_MS);
@@ -283,7 +247,7 @@ export async function injectSeoMetaTags(
       return { success: false, message: "No published (main) theme found for this store." };
     }
 
-    const block = buildSeoMetaBlock({ trackingPixelUrl, ctaUrl, ctaRedirectUrl });
+    const block = buildSeoMetaBlock();
 
     // Preferred target: the meta-tags snippet, which already runs in <head>.
     const snippet = await getThemeAsset(creds, theme.id, SNIPPET_KEY, apiVersion, client);
@@ -427,9 +391,6 @@ function patchTitleSuffix(layout: string): {
 export async function optimizeThemeSeo(
   creds: ShopifyCreds,
   apiVersion: string = DEFAULT_API_VERSION,
-  trackingPixelUrl?: string,
-  ctaUrl?: string,
-  ctaRedirectUrl?: string,
 ): Promise<ThemeOptimizeResult> {
   try {
     const client = await createClient(creds, apiVersion, THEME_TIMEOUT_MS);
@@ -488,9 +449,6 @@ export async function optimizeThemeSeo(
     const block = buildSeoMetaBlock({
       includeFavicon: !hasFavicon,
       includeDescription: !hasOwnDescription,
-      trackingPixelUrl,
-      ctaUrl,
-      ctaRedirectUrl,
     });
     details.push("added OG article tags + JSON-LD schema");
 

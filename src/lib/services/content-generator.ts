@@ -13,7 +13,11 @@ import {
   DEFAULT_CONTENT_MODEL,
   type ContentModel,
 } from "@/lib/settings/app-settings";
-import { ctaRedirectUrl, trackingPixelImg } from "@/lib/services/link-tracker";
+import {
+  COMMERCIAL_LINK_REL,
+  EDITORIAL_LINK_REL,
+  withUtm,
+} from "@/lib/content/outbound-links";
 import { SUB_NICHES } from "@/lib/content/libraries/sub-niches";
 import { findMostSimilarTitle } from "@/lib/content/topic-similarity";
 import {
@@ -303,7 +307,7 @@ const NICHE_CONTEXTS: Record<string, NicheContext> = {
     contentStyle: "Focused on NEW gym launches and franchise openings — not ongoing membership comparisons (that's a separate niche). Cover ribbon-cutting dates, founder backgrounds, equipment partners, opening-day promotions, the franchise's local footprint. Name specific chains by their real local names — in Quebec: Énergie Cardio, Éconofitness, Nautilus Plus, Buzzfit, World Gym. Distinguish franchise vs corporate vs independent. Mention permit timing or municipal context when known.",
     keyTopics: ["new gym opening", "franchise launch", "ribbon cutting", "grand opening promotions", "franchise owner", "Énergie Cardio", "Éconofitness", "Nautilus Plus", "Buzzfit", "World Gym", "first-month free", "equipment partner", "build-out timeline"],
   },
-    real_estate: {
+  real_estate: {
     label: "Real Estate & Property",
     industry: "Real Estate",
     defaultAudience: "Home buyers and sellers, first-time mortgage applicants, small-to-mid investors evaluating rental or flip opportunities, real estate agents, brokerage staff, and local-market journalists",
@@ -489,6 +493,8 @@ export interface GenerateOptions {
    * instructed to weave 2-4 of these as inline <a href> links — adds the
    * single SEO signal the audit flagged as missing (internal link graph).
    */
+  blogDomain?: string | null;
+
   internalLinkRefs?: Array<{ title: string; url: string }>;
   /**
    * Distilled summaries of the client's active Knowledge Base documents for
@@ -521,9 +527,9 @@ export interface GenerateOptions {
    */
   registrationForm?: { actionUrl: string; placement?: string; color?: string };
   /**
-   * The generated_posts row id for this post. When set, the CTA is routed
-   * through the tracked redirect (/r/{postId}) and a page-view pixel is
-   * appended, so clicks and views are logged. Omit to skip tracking.
+   * The generated_posts row id for this post. Carried as utm_content on the
+   * CTA and money links so the client's analytics attribute a session to a
+   * specific article, and used as the registration form's hidden postId.
    */
   postId?: string;
   /**
@@ -1399,7 +1405,7 @@ async function callDeepSeekOnce(
   if (boundedMaxTokens < maxTokens) {
     console.warn(
       `[deepseek] requested max_tokens ${maxTokens} clamped to ${boundedMaxTokens} ` +
-        `(DEEPSEEK_MAX_OUTPUT_TOKENS). Raise it if ${DEEPSEEK_MODEL} supports more.`,
+      `(DEEPSEEK_MAX_OUTPUT_TOKENS). Raise it if ${DEEPSEEK_MODEL} supports more.`,
     );
   }
 
@@ -1993,9 +1999,8 @@ Describe the photographic scene for the hero image.`;
       site: "content-generator.sceneSummary",
       code: "SCENE_SUMMARY_FAILED",
       severity: "warn",
-      message: `Scene summarization failed: ${
-        err instanceof Error ? err.message : String(err)
-      }`,
+      message: `Scene summarization failed: ${err instanceof Error ? err.message : String(err)
+        }`,
     });
     return null;
   }
@@ -2242,26 +2247,6 @@ function bodyImageClassForBlog(seed: string | undefined): string {
     "body-figure",
     "feature-image",
     "content-figure",
-  ];
-  if (!seed) return POOL[0];
-  return POOL[hashSeed(seed) % POOL.length];
-}
-
-/**
- * Per-blog `rel` value for outbound links. A network where every external
- * link is `rel="noopener nofollow"` is a trivial fingerprint; real sites
- * vary in how (and whether) they nofollow/sponsor outbound links. Same blog
- * → same rel always. `noopener` is always present (security), the
- * follow/nofollow signalling rotates.
- */
-function relForBlog(seed: string | undefined): string {
-  const POOL = [
-    "noopener nofollow",
-    "noopener",
-    "nofollow noopener",
-    "noopener noreferrer nofollow",
-    "external nofollow noopener",
-    "noopener ugc",
   ];
   if (!seed) return POOL[0];
   return POOL[hashSeed(seed) % POOL.length];
@@ -2527,8 +2512,8 @@ function buildCustomSystemPrompt(
   const disclaimers = (niche.disclaimers ?? []).filter(Boolean);
   const complianceBlock = disclaimers.length
     ? `\n\nCOMPLIANCE (locked — include these verbatim, non-negotiable):\n${disclaimers
-        .map((d) => `- ${d}`)
-        .join("\n")}`
+      .map((d) => `- ${d}`)
+      .join("\n")}`
     : "";
 
   // Optional persona layer: when the operator has opted to STACK the persona
@@ -2612,6 +2597,20 @@ function safeCssColor(v: string | null | undefined): string | null {
   return /^#[0-9a-f]{3,8}$/i.test(s) ? s : null;
 }
 
+/**
+ * Escape a URL for use inside an HTML attribute. Money links now carry UTM
+ * query strings, so a bare "&" would be an HTML parse error (and gets mangled
+ * by some WordPress/Shopify sanitizers) — encode it. Quotes and angle brackets
+ * are percent-encoded exactly as the previous inline escaping did.
+ */
+function safeAttrUrl(url: string): string {
+  return url
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "%22")
+    .replace(/</g, "%3C")
+    .replace(/>/g, "%3E");
+}
+
 function buildCtaHtml(
   cta?: { label: string; url: string; color?: string },
   seed?: string,
@@ -2624,18 +2623,22 @@ function buildCtaHtml(
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
-  const safeUrl = url.replace(/"/g, "%22").replace(/</g, "%3C").replace(/>/g, "%3E");
+  const safeUrl = safeAttrUrl(url);
 
-  // Per-blog button appearance + rel so the CTA markup isn't byte-identical
+  // Per-blog button APPEARANCE only, so the CTA markup isn't byte-identical
   // across the network. Same blog → same button always. A client-chosen color
   // overrides the derived background when set.
+  //
+  // The `rel` is NOT randomized (T02). This is a paid placement on every blog,
+  // so every blog declares it the same, honest way: sponsored + noopener. The
+  // old per-blog pool nofollowed the client's own CTA on 5 blogs in 6 and
+  // stripped the referrer on 1 in 6.
   const s = ctaStyleForBlog(seed);
-  const rel = relForBlog(seed);
   const bg = safeCssColor(cta?.color) ?? s.bg;
 
   return (
     `\n<div style="text-align:${s.align};margin:${s.margin};">` +
-    `<a href="${safeUrl}" target="_blank" rel="${rel}" ` +
+    `<a href="${safeUrl}" target="_blank" rel="${COMMERCIAL_LINK_REL}" ` +
     `style="display:inline-block;padding:${s.padding};background:${bg};color:#ffffff;` +
     `font-weight:${s.weight};font-size:${s.fontSize};text-decoration:none;border-radius:${s.radius};">` +
     `${safeLabel}</a></div>`
@@ -2732,7 +2735,6 @@ function injectMoneyLink(
   body: string,
   url: string,
   terms: string[],
-  seed?: string,
 ): string {
   if (!url || !/^https?:\/\//i.test(url)) return body;
   const pMatch = body.match(/<p[^>]*>([\s\S]*?)<\/p>/i);
@@ -2740,8 +2742,8 @@ function injectMoneyLink(
   const pInner = pMatch[1];
   if (/<a\b/i.test(pInner)) return body; // opening paragraph already links out
 
-  const rel = relForBlog(seed);
-  const safeUrl = url.replace(/"/g, "%22");
+  // Paid placement → one honest, network-wide rel (T02). No seed needed.
+  const safeUrl = safeAttrUrl(url);
   for (const term of terms) {
     const t = term.trim();
     if (!t) continue;
@@ -2751,7 +2753,8 @@ function injectMoneyLink(
     if (!m) continue;
     const start = m.index + m[1].length;
     const matched = pInner.slice(start, start + m[2].length);
-    const anchor = `<a href="${safeUrl}" target="_blank" rel="${rel}">${matched}</a>`;
+    const anchor =
+      `<a href="${safeUrl}" target="_blank" rel="${COMMERCIAL_LINK_REL}">${matched}</a>`;
     const newInner = pInner.slice(0, start) + anchor + pInner.slice(start + m[2].length);
     return body.replace(pInner, newInner);
   }
@@ -2920,9 +2923,8 @@ export async function ideateTopic(
         site: "content-generator.ideateNews",
         code: "NEWS_CONTEXT_FAILED",
         severity: "warn",
-        message: `news context lookup failed: ${
-          err instanceof Error ? err.message : String(err)
-        }`,
+        message: `news context lookup failed: ${err instanceof Error ? err.message : String(err)
+          }`,
         context: { verticalKey: opts.verticalKey ?? null },
       });
     }
@@ -3076,7 +3078,7 @@ Suggest the next post's topic.`;
 
     console.info(
       `[ideateTopic] attempt ${attempt} too similar (${Math.round(similar.score * 100)}%) ` +
-        `to "${similar.title}" — retrying`,
+      `to "${similar.title}" — retrying`,
     );
     rejectionNote =
       `\n\nYour previous suggestion "${result.topic}" is too similar to an existing title ` +
@@ -3206,7 +3208,7 @@ export async function generateContent(opts: GenerateOptions): Promise<Generation
           `${refList}\n\n` +
           `LINKING RULES:\n` +
           `- Pick 1-3 of the above whose headline genuinely relates to a point you're making.\n` +
-          `- Use HTML <a href="URL" target="_blank" rel="${relForBlog(opts.blogSeed)}">descriptive anchor text</a>.\n` +
+          `- Use HTML <a href="URL" target="_blank" rel="${EDITORIAL_LINK_REL}">descriptive anchor text</a>.\n` +
           `- Anchor text should describe what the reader is clicking to, NOT raw URLs or "click here".\n` +
           `- If none of the references fits naturally, do NOT force a link — quality over count.\n` +
           `- Never include all 6; keep external link count to 3 max.`;
@@ -3217,9 +3219,8 @@ export async function generateContent(opts: GenerateOptions): Promise<Generation
         site: "content-generator.newsLinks",
         code: "NEWS_LINKS_FAILED",
         severity: "warn",
-        message: `news-links lookup failed: ${
-          err instanceof Error ? err.message : String(err)
-        }`,
+        message: `news-links lookup failed: ${err instanceof Error ? err.message : String(err)
+          }`,
       });
     }
   }
@@ -3351,7 +3352,7 @@ export async function generateContent(opts: GenerateOptions): Promise<Generation
   const baseMaxTokens = outputTokenBudget(wordBudget, opts.language);
   console.info(
     `[content-generator] token budget: ${baseMaxTokens} ` +
-      `(lang=${opts.language ?? "en"}, words=${wordBudget})`,
+    `(lang=${opts.language ?? "en"}, words=${wordBudget})`,
   );
 
   // 1. Generate — with ONE retry on a bad attempt. An attempt is bad when it
@@ -3383,9 +3384,9 @@ export async function generateContent(opts: GenerateOptions): Promise<Generation
   const minWords =
     usingProfile && opts.styleProfile
       ? Math.max(
-          ABSOLUTE_MIN_WORDS,
-          Math.min(opts.styleProfile.wordBandMin, MIN_WORDS),
-        )
+        ABSOLUTE_MIN_WORDS,
+        Math.min(opts.styleProfile.wordBandMin, MIN_WORDS),
+      )
       : MIN_WORDS;
 
   for (let shapeAttempt = 0; shapeAttempt <= MAX_SHAPE_RETRIES; shapeAttempt++) {
@@ -3412,7 +3413,7 @@ The "content" field is the full HTML article body — at least ${MIN_WORDS} word
       shapeAttempt === 0
         ? user
         : user +
-          (lastAttemptTruncated ? LENGTH_RETRY_REMINDER : SHAPE_RETRY_REMINDER);
+        (lastAttemptTruncated ? LENGTH_RETRY_REMINDER : SHAPE_RETRY_REMINDER);
 
     // Give the retry 50% more room. Harmless when the first failure was shape
     // drift (unused tokens are not billed) and decisive when it was length.
@@ -3422,8 +3423,8 @@ The "content" field is the full HTML article body — at least ${MIN_WORDS} word
     if (shapeAttempt > 0) {
       console.info(
         `[content-generator] retry attempt ${shapeAttempt + 1} ` +
-          `(cause: ${lastFailure || "unknown"}) using simplified fallback prompt, ` +
-          `maxTokens=${attemptMaxTokens}`,
+        `(cause: ${lastFailure || "unknown"}) using simplified fallback prompt, ` +
+        `maxTokens=${attemptMaxTokens}`,
       );
     }
 
@@ -3516,15 +3517,15 @@ The "content" field is the full HTML article body — at least ${MIN_WORDS} word
       if (shapeAttempt < MAX_SHAPE_RETRIES) {
         console.warn(
           `[content-generator] attempt ${shapeAttempt + 1} TRUNCATED ` +
-            `(${lastFailure}) — retrying with a larger budget`,
+          `(${lastFailure}) — retrying with a larger budget`,
         );
         parsed = {};
         continue;
       }
       throw new Error(
         `Generation truncated on every attempt (${lastFailure}). ` +
-          `Raise the ratios in src/lib/services/content-token-budget.ts, or ` +
-          `lower GLOBAL_WORD_BAND_MAX in src/lib/content/config.ts.`,
+        `Raise the ratios in src/lib/services/content-token-budget.ts, or ` +
+        `lower GLOBAL_WORD_BAND_MAX in src/lib/content/config.ts.`,
       );
     }
     lastAttemptTruncated = false;
@@ -3569,7 +3570,7 @@ The "content" field is the full HTML article body — at least ${MIN_WORDS} word
       if (shapeAttempt < MAX_SHAPE_RETRIES) {
         console.warn(
           `[content-generator] attempt ${shapeAttempt + 1} too short ` +
-            `(${rawWords} < ${minWords}) — retrying`,
+          `(${rawWords} < ${minWords}) — retrying`,
         );
         continue;
       }
@@ -3587,9 +3588,9 @@ The "content" field is the full HTML article body — at least ${MIN_WORDS} word
   if (!parsed.title || !parsed.content) {
     throw new Error(
       `Claude response missing required fields (title, content) after ${MAX_SHAPE_RETRIES + 1} attempts. ` +
-        `Returned keys: ${lastShapeKeys}. Shape: ${lastShapePreview}. ` +
-        `Reconstruction did not match any known variant — extend ` +
-        `reconstructContentFromParts() in content-generator.ts.`,
+      `Returned keys: ${lastShapeKeys}. Shape: ${lastShapePreview}. ` +
+      `Reconstruction did not match any known variant — extend ` +
+      `reconstructContentFromParts() in content-generator.ts.`,
     );
   }
   // 3. Format + sanitize, strip any Claude-emitted images (they'd be broken).
@@ -3631,9 +3632,9 @@ The "content" field is the full HTML article body — at least ${MIN_WORDS} word
   if (postProcessWordCount < minWords) {
     throw new Error(
       `Generated content is ${postProcessWordCount} words, below the ` +
-        `${minWords}-word minimum` +
-        (usingProfile ? " (profile path)" : "") +
-        (lastFailure ? ` | last attempt: ${lastFailure}` : ""),
+      `${minWords}-word minimum` +
+      (usingProfile ? " (profile path)" : "") +
+      (lastFailure ? ` | last attempt: ${lastFailure}` : ""),
     );
   }
 
@@ -3644,10 +3645,10 @@ The "content" field is the full HTML article body — at least ${MIN_WORDS} word
   // the SERP — bypassed every check.
   const metaTargetContext: LocalTargetMetaContext | undefined = opts.localTarget
     ? {
-        keyword: opts.localTarget.keyword,
-        city: opts.localTarget.city,
-        brandName: opts.localTarget.brandName,
-      }
+      keyword: opts.localTarget.keyword,
+      city: opts.localTarget.city,
+      brandName: opts.localTarget.brandName,
+    }
     : undefined;
   const shortFields = {
     title: parsed.title,
@@ -3799,11 +3800,10 @@ The "content" field is the full HTML article body — at least ${MIN_WORDS} word
         site: "content-generator.images",
         code: "IMAGE_HERO_FAILED",
         severity: "warn",
-        message: `Hero image generation failed: ${
-          heroResult.reason instanceof Error
-            ? heroResult.reason.message
-            : String(heroResult.reason)
-        }`,
+        message: `Hero image generation failed: ${heroResult.reason instanceof Error
+          ? heroResult.reason.message
+          : String(heroResult.reason)
+          }`,
         postId: opts.postId ?? null,
       });
     }
@@ -3818,11 +3818,10 @@ The "content" field is the full HTML article body — at least ${MIN_WORDS} word
         site: "content-generator.images",
         code: "IMAGE_BODY_FAILED",
         severity: "warn",
-        message: `Body image generation failed: ${
-          bodyResult.reason instanceof Error
-            ? bodyResult.reason.message
-            : String(bodyResult.reason)
-        }`,
+        message: `Body image generation failed: ${bodyResult.reason instanceof Error
+          ? bodyResult.reason.message
+          : String(bodyResult.reason)
+          }`,
         postId: opts.postId ?? null,
       });
     }
@@ -3855,9 +3854,8 @@ The "content" field is the full HTML article body — at least ${MIN_WORDS} word
           site: "content-generator.images",
           code: "IMAGE_HERO_RETRY_FAILED",
           severity: "error",
-          message: `Hero image retry also failed: ${
-            retryErr instanceof Error ? retryErr.message : String(retryErr)
-          }`,
+          message: `Hero image retry also failed: ${retryErr instanceof Error ? retryErr.message : String(retryErr)
+            }`,
           postId: opts.postId ?? null,
         });
       }
@@ -3885,9 +3883,8 @@ The "content" field is the full HTML article body — at least ${MIN_WORDS} word
           site: "content-generator.images",
           code: "IMAGE_BODY_RETRY_FAILED",
           severity: "warn",
-          message: `Body image retry also failed: ${
-            retryErr instanceof Error ? retryErr.message : String(retryErr)
-          }`,
+          message: `Body image retry also failed: ${retryErr instanceof Error ? retryErr.message : String(retryErr)
+            }`,
           postId: opts.postId ?? null,
         });
       }
@@ -3899,9 +3896,8 @@ The "content" field is the full HTML article body — at least ${MIN_WORDS} word
       site: "content-generator.images",
       code: "IMAGE_PIPELINE_FAILED",
       severity: "error",
-      message: `Image pipeline failed: ${
-        err instanceof Error ? err.message : String(err)
-      }`,
+      message: `Image pipeline failed: ${err instanceof Error ? err.message : String(err)
+        }`,
       postId: opts.postId ?? null,
     });
   }
@@ -3934,21 +3930,35 @@ The "content" field is the full HTML article body — at least ${MIN_WORDS} word
   }
 
   // Inject the client's call-to-action button at its configured position(s)
-  // — no-op when the client has no CTA configured. When we know the post id,
-  // point the CTA at the netgrid redirect (/r/{postId}) so clicks are tracked;
-  // the redirect resolves the client's real CTA URL at click time.
-  const ctaForInject =
-    opts.postId && opts.cta
-      ? { ...opts.cta, url: ctaRedirectUrl(opts.postId) }
-      : opts.cta;
+  // — no-op when the client has no CTA configured.
+  //
+  // T02: the button links DIRECTLY to the client's destination. It used to be
+  // rewritten to {NEXT_PUBLIC_APP_URL}/r/{postId}, which put one shared netgrid
+  // host into the HTML of every site in the network and hid the client's own
+  // domain from the markup. Attribution moved to UTM parameters, which the
+  // client's GA4 / Shopify analytics already parse.
+  const ctaForInject = opts.cta
+    ? {
+        ...opts.cta,
+        url: withUtm(opts.cta.url, {
+          blogDomain: opts.blogDomain,
+          medium: "cta_button",
+          postId: opts.postId,
+        }),
+      }
+    : opts.cta;
   body = injectCta(body, ctaForInject, opts.blogSeed);
 
   // In-body buy-phrase money link (funnel) — link the first buy-phrase/compound
-  // mention to the site's own domain. Routed through the tracked redirect when
-  // the post id is known, so these clicks are logged like CTA clicks.
+  // mention to the client's destination, tagged so the click is distinguishable
+  // from a CTA-button click in the client's analytics.
   if (opts.buyLink && opts.buyLink.terms.length > 0) {
-    const buyUrl = opts.postId ? ctaRedirectUrl(opts.postId) : opts.buyLink.url;
-    body = injectMoneyLink(body, buyUrl, opts.buyLink.terms, opts.blogSeed);
+    const buyUrl = withUtm(opts.buyLink.url, {
+      blogDomain: opts.blogDomain,
+      medium: "body_link",
+      postId: opts.postId,
+    });
+    body = injectMoneyLink(body, buyUrl, opts.buyLink.terms);
   }
 
   // Mini registration form (Name / Location / Email) at the configured
@@ -3962,11 +3972,11 @@ The "content" field is the full HTML article body — at least ${MIN_WORDS} word
     );
   }
 
-  // Page-view tracking pixel — appended once we know the post id so views on
-  // the published page are logged. No-op without a post id.
-  if (opts.postId) {
-    body = body + trackingPixelImg(opts.postId);
-  }
+  // T02: the page-view tracking pixel that used to be appended here is gone.
+  // It embedded {NEXT_PUBLIC_APP_URL}/api/track/px/{postId} — one shared host —
+  // into the body of every published article on every site in the network.
+  // Page views now come from the client's own analytics and, once T04 lands,
+  // from Search Console impressions per URL.
 
   // 6. Scoring removed (per footprint audit insight 2). The old
   //    analyzeContent call cost ~$0.0015/post AND optimized to exactly the

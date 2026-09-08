@@ -9,54 +9,72 @@ import {
   getPageRawContent,
   updatePageContent,
 } from "@/lib/services/wp-client";
-import {
-  blogTrackingPixelImg,
-  blogCtaRedirectUrl,
-} from "@/lib/services/link-tracker";
+import { blogCtaRedirectUrl } from "@/lib/services/link-tracker";
+import { effectiveCtaDestination } from "@/lib/content/cta-target";
+import { COMMERCIAL_LINK_REL, withUtm } from "@/lib/content/outbound-links";
 
 export interface WpHomepageTrackerResult {
   success: boolean;
   message: string;
-  action?: "installed" | "updated" | "unchanged";
+  action?: "removed" | "unchanged";
 }
 
-const MARK_BEGIN = "<!-- netgrid:homepage-tracker -->";
-const MARK_END = "<!-- /netgrid:homepage-tracker -->";
 const BLOCK_RE =
   /<!-- netgrid:homepage-tracker -->[\s\S]*?<!-- \/netgrid:homepage-tracker -->/g;
 
+/** Escape a URL for a double-quoted HTML attribute (UTMs introduce "&"). */
+function safeAttrUrl(url: string): string {
+  return url
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "%22")
+    .replace(/</g, "%3C")
+    .replace(/>/g, "%3E");
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 /**
- * Repoint homepage links whose href is the client's CTA URL to the tracked
- * blog-level redirect, so CTA clicks on the homepage are logged. Only touches
- * `href="..."` / `href='...'` attributes that exactly match, and is idempotent
- * (once rewritten, the raw CTA URL no longer matches).
+ * Repoint homepage links that were rewritten to the netgrid blog-level redirect
+ * back at the client's own destination, tagged for attribution and marked
+ * rel="sponsored noopener". Inverse of the rewriteCtaHrefs this file used to
+ * ship; idempotent, because once repointed the redirect URL no longer matches.
  */
-function rewriteCtaHrefs(
+function restoreCtaHrefs(
   html: string,
-  ctaUrl: string,
   redirectUrl: string,
+  destination: string,
 ): { html: string; count: number } {
-  const esc = ctaUrl.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const re = new RegExp(`href=(["'])${esc}\\1`, "g");
+  const hrefRe = new RegExp(
+    `href\\s*=\\s*(["'])${escapeRegExp(redirectUrl)}\\1`,
+    "i",
+  );
+  const relRe = /\srel\s*=\s*(["'])[^"']*\1/i;
+  const href = safeAttrUrl(destination);
   let count = 0;
-  const out = html.replace(re, (_m, q) => {
+  const out = html.replace(/<a\b[^>]*>/gi, (tag) => {
+    if (!hrefRe.test(tag)) return tag;
     count++;
-    return `href=${q}${redirectUrl}${q}`;
+    let next = tag.replace(hrefRe, (_m, q) => `href=${q}${href}${q}`);
+    next = relRe.test(next)
+      ? next.replace(relRe, (_m, q) => ` rel=${q}${COMMERCIAL_LINK_REL}${q}`)
+      : next.replace(/^<a\b/i, `<a rel="${COMMERCIAL_LINK_REL}"`);
+    return next;
   });
   return { html: out, count };
 }
 
 /**
- * Install (or refresh) a site-wide page-view pixel on a WordPress blog's
- * homepage. Only works when the site uses a static Page as its homepage
- * (Settings → Reading → "A static page"): we embed the blog-level tracking
- * pixel into that page's content. When the homepage is the blog post index
- * there is no single page to edit via the REST API, so we report that instead.
+ * Remove netgrid's site-wide tracking from a WordPress blog's static homepage
+ * (T02): strip the managed pixel block and repoint any homepage anchor that was
+ * rewritten to /r/blog/{blogId} back at the client's own destination.
  *
- * Idempotent — the managed block is delimited by HTML-comment markers and
- * replaced in place on re-run.
+ * Only works when the site uses a static Page as its homepage (Settings →
+ * Reading), which is the same constraint the installer had. Idempotent — a
+ * second run reports "unchanged".
  */
-export async function installWpHomepageTracker(
+export async function removeWpHomepageTracker(
   blogId: string,
 ): Promise<WpHomepageTrackerResult> {
   await requireAdmin();
@@ -93,9 +111,10 @@ export async function installWpHomepageTracker(
   }
   if (settings.showOnFront !== "page" || !settings.pageOnFront) {
     return {
-      success: false,
+      success: true,
       message:
-        "The homepage is the blog post index, not a static page — there's no single page to inject a pixel into via the REST API. Set a static homepage under Settings → Reading, then re-run; or add the pixel with a header-snippet plugin.",
+        "The homepage is the blog post index, not a static page — no netgrid block was ever installed there.",
+      action: "unchanged",
     };
   }
 
@@ -108,35 +127,41 @@ export async function installWpHomepageTracker(
     };
   }
 
-  // The client's active CTA URL, so we can also track homepage CTA clicks.
+  // The destination the redirect resolved to at click time. Mirrors
+  // link-tracker.resolveBlogRedirect exactly: peptides use the blog's own
+  // domain, every other niche the client's ctaUrl — and, as there, WITHOUT
+  // gating on ctaEnabled, so a client who later toggled the CTA off still gets
+  // their links restored instead of stranded on /r/blog/{blogId}.
   const [client] = await db
-    .select({ ctaEnabled: clients.ctaEnabled, ctaUrl: clients.ctaUrl })
+    .select({ niche: clients.niche, ctaUrl: clients.ctaUrl })
     .from(clients)
     .where(eq(clients.id, blog.clientId))
     .limit(1);
-  const ctaUrl = client?.ctaEnabled && client.ctaUrl ? client.ctaUrl : null;
+  const destination = effectiveCtaDestination({
+    niche: client?.niche,
+    blogDomain: blog.domain,
+    ctaUrl: client?.ctaUrl,
+  });
 
-  const hadBlock = BLOCK_RE.test(raw);
-  let stripped = raw.replace(BLOCK_RE, "").replace(/\s+$/, "");
-
-  let ctaRewrites = 0;
-  if (ctaUrl) {
-    const rewritten = rewriteCtaHrefs(
-      stripped,
-      ctaUrl,
+  let next = raw.replace(BLOCK_RE, "").replace(/\n{3,}/g, "\n\n");
+  let restored = 0;
+  if (destination) {
+    const r = restoreCtaHrefs(
+      next,
       blogCtaRedirectUrl(blogId),
+      withUtm(destination, {
+        blogDomain: blog.domain,
+        medium: "homepage_cta",
+      }),
     );
-    stripped = rewritten.html;
-    ctaRewrites = rewritten.count;
+    next = r.html;
+    restored = r.count;
   }
-
-  const block = `${MARK_BEGIN}\n${blogTrackingPixelImg(blogId)}\n${MARK_END}`;
-  const next = stripped ? `${stripped}\n\n${block}\n` : `${block}\n`;
 
   if (next.trim() === raw.trim()) {
     return {
       success: true,
-      message: "Homepage already has the current tracking pixel — no change.",
+      message: "Homepage carries no netgrid tracking — nothing to remove.",
       action: "unchanged",
     };
   }
@@ -149,16 +174,16 @@ export async function installWpHomepageTracker(
     };
   }
 
-  const ctaNote =
-    ctaRewrites > 0
-      ? ` ${ctaRewrites} CTA link${ctaRewrites === 1 ? "" : "s"} now tracked.`
-      : ctaUrl
-        ? " No CTA links matching the client's CTA URL were found in the homepage content."
-        : "";
+  const note =
+    restored > 0
+      ? ` ${restored} CTA link${restored === 1 ? "" : "s"} now point directly at the client.`
+      : destination
+        ? " No redirect-wrapped CTA links were present."
+        : " No CTA destination is configured for this client, so no links were repointed.";
 
   return {
     success: true,
-    message: `Tracking pixel ${hadBlock ? "updated" : "installed"} on the homepage (page #${pageId}).${ctaNote} New posts already carry their own pixel.`,
-    action: hadBlock ? "updated" : "installed",
+    message: `Netgrid homepage tracking removed (page #${pageId}).${note}`,
+    action: "removed",
   };
 }

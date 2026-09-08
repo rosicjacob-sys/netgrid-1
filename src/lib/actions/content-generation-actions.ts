@@ -33,7 +33,7 @@ import {
 } from "@/lib/actions/keyword-target-actions";
 import { ctaColorHex } from "@/lib/content/cta-colors";
 import { resolveNextPostLanguage } from "@/lib/content/post-language";
-import { ctaRedirectUrl, getAppBaseUrl } from "@/lib/services/link-tracker";
+import { getAppBaseUrl } from "@/lib/services/link-tracker";
 import { pingIndexNowFireAndForget } from "@/lib/services/index-now-pinger";
 import { scanPostAfterPublishFireAndForget } from "@/lib/services/post-seo-runner";
 import { logScrubberVerdict } from "@/lib/content/scrubber";
@@ -651,6 +651,8 @@ export async function runGenerateAndPublish(
       verticalKey: verticalForPost?.key ?? null,
       language: postLanguage,
       blogSeed: blog.id,
+      // utm_source for the direct CTA / money links (T02).
+      blogDomain: blog.domain,
       // Operator-confirmed store name only — NOT the deriveBrandName()
       // suggestion used for localTarget/placeholders above (brand.ts:1-14).
       brandName: blog.brandName,
@@ -658,8 +660,15 @@ export async function runGenerateAndPublish(
       knowledgeSummaries: knowledge.summaries,
       localTarget: useLocalTarget ? localTarget : undefined,
       cta,
+      // T02: the money link points at the client's real destination, not at
+      // /r/{postId}. Same target the redirect resolved to at click time — the
+      // client's CTA URL, or (peptides) the blog's own domain. An empty string
+      // is safe: injectMoneyLink no-ops on anything that isn't http(s).
       buyLink: input.buyLinkTerms?.length
-        ? { url: ctaRedirectUrl(generatedPostId), terms: input.buyLinkTerms }
+        ? {
+            url: cta?.url ?? blogDomainCtaUrl(blog.domain) ?? "",
+            terms: input.buyLinkTerms,
+          }
         : undefined,
       registrationForm: row.registrationEnabled
         ? {
@@ -1056,6 +1065,7 @@ export async function regenerateAndUpdatePost(
     // resolved next-language for legacy rows written before language was stored.
     language: (post.language as "en" | "fr" | null) ?? ctx.language,
     blogSeed: blog.id,
+    blogDomain: blog.domain,
     internalLinkRefs,
     knowledgeSummaries: ctx.knowledge.summaries,
     cta: ctx.cta,
