@@ -2603,7 +2603,7 @@ function safeCssColor(v: string | null | undefined): string | null {
  * by some WordPress/Shopify sanitizers) — encode it. Quotes and angle brackets
  * are percent-encoded exactly as the previous inline escaping did.
  */
-function safeAttrUrl(url: string): string {
+export function safeAttrUrl(url: string): string {
   return url
     .replace(/&/g, "&amp;")
     .replace(/"/g, "%22")
@@ -2611,7 +2611,7 @@ function safeAttrUrl(url: string): string {
     .replace(/>/g, "%3E");
 }
 
-function buildCtaHtml(
+export function buildCtaHtml(
   cta?: { label: string; url: string; color?: string },
   seed?: string,
 ): string {
@@ -2731,7 +2731,7 @@ function escapeRegExp(s: string): string {
  * contextual link near the top without ever nesting anchors or touching
  * headings/markup. Returns the body unchanged when no term is found.
  */
-function injectMoneyLink(
+export function injectMoneyLink(
   body: string,
   url: string,
   terms: string[],
