@@ -705,7 +705,13 @@ export function BlogPostsPanel({
                     <TableHead>Status</TableHead>
                     <TableHead>Words</TableHead>
                     <TableHead>SEO</TableHead>
-                    <TableHead>Traffic</TableHead>
+                    <TableHead>
+                      <span
+                        title="Historic page views · CTA clicks. Netgrid-side tracking was retired 2026-09-08 (T02) — these numbers no longer grow; current traffic lives in the client's own GA4/Shopify analytics."
+                      >
+                        Traffic*
+                      </span>
+                    </TableHead>
                     <TableHead>Published</TableHead>
                     <TableHead>Auto?</TableHead>
                     <TableHead className="w-[180px] text-right">

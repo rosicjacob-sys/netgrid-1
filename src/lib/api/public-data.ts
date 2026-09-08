@@ -72,6 +72,12 @@ interface Traffic {
 
 // ─── Aggregations (all fail-safe: an un-migrated link_events table → zeros) ──
 
+// HISTORIC: netgrid-side tracking was retired 2026-09-08 (T02). link_events
+// stopped growing from that date; the numbers below are accurate up to it and
+// are served for the historical record. Current traffic is measured by UTM
+// attribution (utm_campaign=netgrid_content) in the client's own analytics.
+// Any consumer must present these as historic (see docs/marketing-api.md).
+
 /** Views + CTA clicks grouped by clientId, across all clients. */
 async function trafficByClient(since?: Date): Promise<Map<string, Traffic>> {
   const map = new Map<string, Traffic>();

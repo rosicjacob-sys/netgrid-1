@@ -5,6 +5,17 @@ import { linkEvents } from "@/lib/db/schema";
 import { count, eq } from "drizzle-orm";
 import { requireAdmin } from "@/lib/auth/helpers";
 
+/**
+ * HISTORIC TRAFFIC TOTALS — netgrid-side tracking was retired 2026-09-08 (T02).
+ *
+ * These functions aggregate link_events, which stopped growing when the
+ * per-post pixel and the tracked redirect were removed from published posts.
+ * Counts up to that date remain accurate for the historical record; new
+ * traffic is measured by UTM attribution (utm_campaign=netgrid_content) in
+ * each client's own GA4 / Shopify analytics. Present any UI built on these
+ * numbers as historical, so a flat line is not read as a traffic collapse.
+ */
+
 export interface TrafficTotals {
   views: number;
   clicks: number;

@@ -68,9 +68,11 @@ Network-wide totals for an overview widget. No parameters.
 | `clients`        | number         | total clients |
 | `sites`          | number         | total sites (blogs) |
 | `publishedPosts` | number         | published posts across the network |
-| `views`          | number         | all tracked page views |
-| `clicks`         | number         | all tracked CTA clicks |
+| `views`          | number         | HISTORIC page views — netgrid tracking retired 2026-09-08 |
+| `clicks`         | number         | HISTORIC CTA clicks — netgrid tracking retired 2026-09-08 |
 | `avgSeoScore`    | number \| null | 0–100, averaged over all scored sites |
+
+> **`views`/`clicks` are historic.** Netgrid-side tracking (a per-post pixel and a tracked redirect) was retired on **2026-09-08** (T02). These counts stop growing from that date and are kept for the historical record only. Current traffic measurement is UTM-based attribution in each client's own GA4 / Shopify analytics (`utm_campaign=netgrid_content`), which also attributes revenue the pixel never could. Do not read a flat `views` line after 2026-09-08 as a traffic collapse.
 
 ---
 
@@ -118,10 +120,10 @@ List clients with rolled-up stats.
 | `avgSeoScore` | number \| null    | 0–100, averaged over the client's sites; `null` if none scored yet |
 | `lastPostAt`  | string \| null    | ISO 8601; most recent verified post across the client's sites |
 | `postCount`   | number            | published posts across the client's sites |
-| `views`       | number            | tracked page views across the client's sites |
-| `clicks`      | number            | tracked CTA clicks across the client's sites |
+| `views`       | number            | HISTORIC tracked page views (retired 2026-09-08) |
+| `clicks`      | number            | HISTORIC tracked CTA clicks (retired 2026-09-08) |
 
-> Traffic (`views`/`clicks`) counts posts published after tracking was enabled, plus site-wide (homepage / non-article) views on Shopify stores that have the netgrid theme block installed; `0` until traffic accrues. CTR = `clicks / views`. By default the counts are all-time; pass `days` or `since` to scope them to a window (e.g. `?days=30` for the trailing 30 days).
+> **Traffic (`views`/`clicks`) is historic.** Netgrid-side tracking was retired on **2026-09-08** (T02): the per-post pixel and the tracked redirect were removed from new and repaired posts, so these counts stop growing from that date. Counts up to that date remain accurate for the historical record. Current traffic is measured by UTM attribution (`utm_campaign=netgrid_content`) in the client's own GA4 / Shopify analytics — `utm_source` is the publishing site and `utm_content` is the netgrid post id, so exported GA4 reports still join back to these rows. CTR = `clicks / views` (historic). By default the counts are all-time; pass `days` or `since` to scope them to a window (e.g. `?days=30` for the trailing 30 days).
 
 ---
 
@@ -205,8 +207,8 @@ Top-level fields are the same as the list item, plus:
 | `lastPostTitle` | string \| null  | |
 | `lastScanAt`    | string \| null  | ISO 8601, last SEO scan |
 | `postCount`     | number          | published posts on this site |
-| `views`         | number          | tracked page views on this site |
-| `clicks`        | number          | tracked CTA clicks on this site |
+| `views`         | number          | HISTORIC tracked page views on this site (retired 2026-09-08) |
+| `clicks`        | number          | HISTORIC tracked CTA clicks on this site (retired 2026-09-08) |
 | `metrics`       | object \| null  | latest third-party SEO snapshot (see below); `null` if never fetched |
 
 **`sites[].metrics`** (third-party SEO — from Ahrefs/Semrush, latest snapshot):
