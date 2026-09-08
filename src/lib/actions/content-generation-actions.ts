@@ -1363,7 +1363,13 @@ async function runAutoPublishCronInner(
     .where(
       and(
         eq(blogs.status, "active"),
-        eq(clients.status, "active"),
+        // Exclude PAUSED clients only (7073a237's intent: "a paused client's
+        // blogs are skipped"). The original implementation required
+        // status='active', but every client in this deployment is
+        // 'onboarding' — the gate as written silently stopped ALL publishing
+        // the day it deployed (Aug 31). Onboarding clients have always
+        // published; paused is the only exclusion.
+        ne(clients.status, "paused"),
         or(isNotNull(blogs.postingFrequency), isNotNull(blogs.postingFrequencyDays)),
       ),
     )
