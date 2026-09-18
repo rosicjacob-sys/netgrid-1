@@ -776,6 +776,77 @@ export async function updatePostSeo(
 }
 
 /**
+ * Thrown when a site does not have the NetGrid IndexNow MU-plugin installed.
+ * Distinct from a generic failure because the remedy is a one-time file drop
+ * by whoever controls the hosting, not a retry.
+ */
+export class MuPluginMissingError extends Error {
+  constructor(public readonly siteUrl: string) {
+    super(
+      `NetGrid IndexNow MU-plugin is not installed on ${siteUrl} — ` +
+        `POST /wp-json/netgrid/v1/indexnow-key returned 404. Copy ` +
+        `docs/indexnow/netgrid-indexnow.php into wp-content/mu-plugins/.`,
+    );
+    this.name = "MuPluginMissingError";
+  }
+}
+
+/**
+ * Set (or rotate) this site's IndexNow key via the NetGrid MU-plugin, which
+ * then serves it at the DOCUMENT ROOT as text/plain.
+ *
+ * Replaces the previous media-library upload. That approach put the key at
+ * `/wp-content/uploads/YYYY/MM/{key}.txt`, and IndexNow scopes a key file to
+ * its own directory — so it authorised nothing but the uploads folder, while
+ * every URL we submit is a root-level permalink. Every WordPress ping was
+ * being rejected. (The old code also matched its idempotency check with
+ * `source_url.includes(key)`, so a WordPress-deduplicated `{key}-1.txt` was
+ * returned as the key location; IndexNow requires the file to be named
+ * exactly `{key}.txt`.)
+ *
+ * Idempotent: the plugin does update_option, so repeat calls with the same key
+ * are a no-op. The caller (index-now-deployer) is responsible for verifying
+ * the file is actually reachable afterwards — a site whose nginx config serves
+ * *.txt from disk will accept this call and still 404 the file.
+ *
+ * Throws MuPluginMissingError on 404, or Error(formatError(...)) otherwise.
+ */
+export async function setIndexNowKeyViaMuPlugin(
+  wpUrl: string,
+  username: string,
+  appPassword: string,
+  key: string,
+): Promise<{ keyLocation: string; homeUrl: string }> {
+  const client = createClient(wpUrl, username, appPassword);
+  try {
+    const res = await client.post<{
+      key: string;
+      key_location: string;
+      home_url: string;
+    }>(`/wp-json/netgrid/v1/indexnow-key`, { key });
+
+    const data = res.data;
+    if (
+      !data ||
+      typeof data.key_location !== "string" ||
+      data.key_location === "" ||
+      data.key !== key
+    ) {
+      throw new Error(
+        `MU-plugin returned an unexpected payload: ${JSON.stringify(data).slice(0, 200)}`,
+      );
+    }
+    return { keyLocation: data.key_location, homeUrl: data.home_url };
+  } catch (error) {
+    if (axios.isAxiosError(error) && error.response?.status === 404) {
+      throw new MuPluginMissingError(normalizeWpUrl(wpUrl));
+    }
+    if (error instanceof Error && !axios.isAxiosError(error)) throw error;
+    throw new Error(formatError(error));
+  }
+}
+
+/**
  * Download an image from a public URL and upload it to the WordPress Media
  * Library. Returns the new media row. The caller can pass `id` to the post's
  * `featured_media` field.
@@ -783,68 +854,6 @@ export async function updatePostSeo(
  * Requires the authenticated user to have the `upload_files` capability
  * (admins/editors do by default; authors do; contributors do NOT).
  */
-/**
- * Upload (idempotently) the IndexNow key file to the WordPress media library.
- *
- * IndexNow requires the key file to be reachable at a URL on the same host
- * as the post URLs we submit. WP doesn't let us write to the document root,
- * but the media library URL — `/wp-content/uploads/YYYY/MM/{key}.txt` — IS
- * on the blog's domain, and IndexNow's spec explicitly allows the key file
- * in a subdirectory as long as we pass that exact URL in keyLocation.
- *
- * Flow:
- *   1. Search `/wp-json/wp/v2/media?search={key}` for an existing upload.
- *      WP returns matches by filename — if we've deployed before, the
- *      original `{key}.txt` (or a `-1` variant) is found.
- *   2. If found, return its `source_url`.
- *   3. Else POST the key string as `text/plain` to `/wp-json/wp/v2/media`
- *      with `Content-Disposition: attachment; filename="{key}.txt"`.
- *   4. Return the new `source_url`.
- *
- * Failures are non-fatal — the caller logs and skips the IndexNow ping.
- */
-export async function uploadIndexNowKeyFile(
-  wpUrl: string,
-  username: string,
-  appPassword: string,
-  key: string,
-): Promise<string> {
-  const client = createClient(wpUrl, username, appPassword);
-  const filename = `${key}.txt`;
-
-  // 1. Idempotency check — has the file already been uploaded?
-  try {
-    const search = await client.get<Array<{ source_url: string; title?: { rendered?: string } }>>(
-      `/wp-json/wp/v2/media`,
-      { params: { search: key, per_page: 5 } },
-    );
-    const hit = (search.data || []).find((m) =>
-      typeof m.source_url === "string" && m.source_url.includes(`${key}`),
-    );
-    if (hit && typeof hit.source_url === "string") {
-      return hit.source_url;
-    }
-  } catch {
-    // Search failure isn't fatal — proceed to upload. Worst case we create
-    // a `{key}-1.txt` duplicate on repeat deploys, which still works.
-  }
-
-  // 2. Upload as plain text. WP accepts arbitrary text/* types in /media.
-  const uploadRes = await client.post<{ id: number; source_url: string }>(
-    `/wp-json/wp/v2/media`,
-    Buffer.from(key, "utf-8"),
-    {
-      headers: {
-        "Content-Type": "text/plain",
-        "Content-Disposition": `attachment; filename="${filename}"`,
-      },
-      maxBodyLength: Infinity,
-      maxContentLength: Infinity,
-    },
-  );
-  return uploadRes.data.source_url;
-}
-
 export async function uploadMediaFromUrl(
   wpUrl: string,
   username: string,

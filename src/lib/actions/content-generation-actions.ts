@@ -1164,15 +1164,17 @@ export async function runGenerateAndPublish(
     // 7. Push notification — IndexNow ping covers Bing, Yandex, Seznam,
     //    Naver, Yep, and DuckDuckGo in one POST. Fire-and-forget: the
     //    publish has already succeeded, so a slow/failed engine ping must
-    //    not roll back or delay anything. No-op when INDEXNOW_KEY is unset.
-    //    The first publish per blog also auto-deploys the IndexNow key
-    //    file to the blog's domain via the platform's API (WP REST media
-    //    upload / Shopify Pages create) — no manual setup required.
-    //    Subsequent publishes hit an in-memory cache.
-    //    Google has no IndexNow equivalent and discovers posts via its
-    //    natural sitemap crawl (Yoast/RankMath/Shopify defaults).
+    //    not roll back or delay anything.
+    //    The first publish per blog also deploys the blog's OWN IndexNow key
+    //    to the document root via the NetGrid MU-plugin, and verifies the
+    //    file is actually served before pinging (T15). Subsequent publishes
+    //    hit a TTL cache. Shopify is sitemap-only and records a "skipped"
+    //    event — see docs/indexnow/README.md.
+    //    Google is NOT covered here: it has never supported IndexNow and its
+    //    unauthenticated sitemap ping was retired in 2023. The Google path is
+    //    Search Console sitemap submission (indexing-onboarding.ts).
     if (publish.postUrl) {
-      pingIndexNowFireAndForget(blog, publish.postUrl);
+      pingIndexNowFireAndForget(blog, publish.postUrl, generatedPostId);
     }
 
     // Per-post SEO scan — audit this specific page now that it's live.

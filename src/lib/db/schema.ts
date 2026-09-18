@@ -233,6 +233,23 @@ export const blogs = pgTable("blogs", {
   // Null means "don't touch the shop's existing metafields."
   homepageMetaTitle: varchar("homepage_meta_title", { length: 70 }),
   homepageMetaDescription: varchar("homepage_meta_description", { length: 320 }),
+  // ── IndexNow (see docs/indexnow/README.md) ───────────────────────────
+  // Per-blog key. NEVER shared across the network: the key file is public at
+  // a guessable URL on this domain, so one key across N domains is a one-GET
+  // membership test for the whole network.
+  indexnowKey: varchar("indexnow_key", { length: 128 }),
+  // Absolute URL where THIS blog serves its key file. Normally
+  // https://{domain}/{indexnowKey}.txt — the spec scopes a key file to its
+  // own directory, so it has to be at the root for post URLs to be covered.
+  // Operator-overridable for sites fronted by an edge rule.
+  indexnowKeyLocation: varchar("indexnow_key_location", { length: 1000 }),
+  // Last time we fetched indexnowKeyLocation and got back HTTP 200,
+  // text/plain, body === key. Null means "never verified".
+  indexnowKeyVerifiedAt: timestamp("indexnow_key_verified_at"),
+  // ── Google Search Console sitemap submission ─────────────────────────
+  sitemapUrl: varchar("sitemap_url", { length: 1000 }),
+  sitemapSubmittedAt: timestamp("sitemap_submitted_at"),
+  sitemapSubmitError: text("sitemap_submit_error"),
   // ── Google Search Console (T04) ──
   // gscSiteUrl is the property identifier every Search Console call is made
   // with. Two shapes, decided by the verification method:
@@ -1339,4 +1356,39 @@ export const indexCoverage = pgTable("index_coverage", {
   index("index_coverage_blog_verdict_idx").on(table.blogId, table.verdict),
   index("index_coverage_checked_idx").on(table.lastCheckedAt),
   index("index_coverage_client_idx").on(table.clientId),
+]);
+
+// ─── index_ping_events ───────────────────────────────────────────────────────
+// Append-only record of every attempt to tell a search engine about our
+// content. This exists because the previous implementation reported failure
+// with console.warn only, which made a 100% failure rate indistinguishable
+// from a 100% success rate from every operator surface.
+//
+//   channel "indexnow"        -> a POST to api.indexnow.org
+//   channel "indexnow_deploy" -> making/verifying the key file on the domain
+//   channel "gsc_sitemap"     -> a Search Console sitemaps.submit
+//
+//   outcome "ok"      -> the engine accepted it
+//   outcome "failed"  -> we tried and it was rejected / errored
+//   outcome "skipped" -> we deliberately did not try (unsupported platform,
+//                        kill switch, missing credentials). Not an alert.
+export const indexPingEvents = pgTable("index_ping_events", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  blogId: uuid("blog_id")
+    .notNull()
+    .references(() => blogs.id, { onDelete: "cascade" }),
+  postId: uuid("post_id").references(() => generatedPosts.id, {
+    onDelete: "set null",
+  }),
+  channel: varchar("channel", { length: 24 }).notNull(),
+  outcome: varchar("outcome", { length: 16 }).notNull(),
+  targetUrl: varchar("target_url", { length: 1000 }),
+  keyLocation: varchar("key_location", { length: 1000 }),
+  httpStatus: integer("http_status"),
+  error: text("error"),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+}, (table) => [
+  index("index_ping_events_blog_idx").on(table.blogId, table.channel),
+  index("index_ping_events_outcome_idx").on(table.outcome, table.createdAt),
+  index("index_ping_events_created_idx").on(table.createdAt),
 ]);

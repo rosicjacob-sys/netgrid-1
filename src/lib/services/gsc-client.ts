@@ -338,6 +338,39 @@ export async function submitSitemap(siteUrl: string, feedpath: string): Promise<
   );
 }
 
+export interface SitemapStatus {
+  path: string;
+  lastSubmitted?: string;
+  lastDownloaded?: string;
+  isPending?: boolean;
+  isSitemapsIndex?: boolean;
+  warnings?: string;
+  errors?: string;
+}
+
+/**
+ * Read back a sitemap's processing state (T15).
+ *
+ * submitSitemap only proves Google ACCEPTED the call; this proves the entry is
+ * actually on the property. Returns null when Search Console does not know
+ * this sitemap (404) or the call fails — the caller treats that as "submitted
+ * but unconfirmed", not as a failure, because the submit itself succeeded.
+ */
+export async function getSitemapStatus(
+  siteUrl: string,
+  feedpath: string,
+): Promise<SitemapStatus | null> {
+  try {
+    const res = await withRetry(`sitemaps.get ${feedpath}`, () =>
+      searchConsole().sitemaps.get({ siteUrl, feedpath }),
+    );
+    const data = res.data as SitemapStatus | undefined;
+    return data ?? null;
+  } catch {
+    return null;
+  }
+}
+
 /** Every property this service account can see. Used by the ownership
  * reconciliation check. */
 export async function listSites(): Promise<

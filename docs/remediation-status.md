@@ -60,7 +60,7 @@ the operator actions below are still required.
 
 ---
 
-## Status: 13 of 26 done, 13 remaining
+## Status: 14 of 26 done, 12 remaining — **Phase 2 complete**
 
 ### Done before this session
 
@@ -79,21 +79,16 @@ the operator actions below are still required.
 | **T08** | Publish idempotency | `publish_day` + `day_slot` with a partial unique index; `cron/invoke.sh` retry/timeout fix; strict shard validation (400, not silent default); `reapStuckPublishes()`; `transient` on the result type so the worker-pool retry is reachable. Migration `0040`. |
 | **T03** | Link exchange shutdown | Engine hard-retired behind `LINK_EXCHANGE_RETIRED`; route returns 410 and imports nothing from the service; admin toggle refuses to re-enable; new `link-exchange-removal.ts` stripper + queue + cron. Migration `0041`. |
 | **T04** | Search Console feedback loop | `gsc-client.ts`, `gsc-verifier.ts`, `gsc-sync.ts`, `gsc-index-coverage.ts`, two cron routes, `search_performance` + `index_coverage` tables, 7 Render cron services. Migration `0042`. |
+| **T15** | IndexNow + sitemaps | IndexNow could not have worked on either platform. The WordPress key went into the media library and Shopify's was a themed HTML page — and IndexNow **scopes a key file to its own directory**, so neither authorised a single post URL. Failures were `console.warn` only, so a 100% failure rate looked exactly like a 100% success rate. Now: per-blog keys, a root-served key file via a new MU-plugin, verification of the actual file before any ping, an `index_ping_events` audit table, and the Google path via Search Console sitemap submission. Shopify is deliberately sitemap-only. Migration `0049`. |
 | **T16** | Internal linking wiring | The relink hook had two call sites, both in the manual admin UI — it never fired for the auto-publish cron, which is the dominant publish path. So a cron-published post waited for the hourly backfill and its older siblings never linked forward at all. Now called from `runGenerateAndPublish`, behind a `SEMANTIC_LINK_ON_PUBLISH` kill switch that covers all three paths. Also: inline link candidates are chosen topically instead of by recency (same hybrid formula as the Related-posts engine), the full-text dictionary follows the post's language instead of always `english`, related posts are restricted to the same language, every link target is canonicalised, and the backfill budget is split into a new lane and a stale-refresh lane. Migration `0048`. |
 | **T14** | Yoast meta no-op | Every Yoast WordPress post published with the theme's default title and no meta description, while the log said "(SEO meta set)". Three independent reasons, all returning HTTP 200. Fixed: new `docs/wordpress/netgrid-seo-bridge.php` MU-plugin registers the real `_yoast_wpseo_*` keys for REST with an `auth_callback` and refreshes Yoast's indexable cache; `updateYoastMeta` writes those keys and throws when the bridge is absent; every write is now confirmed against the live `<head>` before anything is called a success. `metaStatus: "written"` now requires live verification. Per-post result persisted on `generated_posts`, bridge version per blog, and a measure-then-repair backfill. Migration `0047`. |
 | **T10** | Keyword pipeline at scale + ledger draining | The weekly refresh scraped every client in one unordered sequential pass (~5 h at 1,500 clients), so it never returned and the ledger rebuild after it never ran at all. Now 4-way sharded, hourly, staggered, with a staleness cursor on `clients.keywords_refresh_attempted_at` stamped *before* the scrape. `markKeywordTargetFailed` no longer buries a row in `failed` on the first transient error — bounded retries with a cool-off, dead-lettering only once the budget is spent, plus a two-window reaper that respects in-flight posts. Scrape locales now come from the client's own blogs instead of guessing from `language_mode`. A blocked scrape is reported instead of looking like "no results". The DataForSEO provenance downgrade is fixed. Migration `0046`, which also releases the existing permanent graves. |
 | **T18** | Post-verification at scale | The sweep was a single unordered sequential loop over every active blog under `curl --max-time 660 --retry 3` — it never finished, and curl retried it three more times while the abandoned handler kept running. Now 4-way sharded (same hash partition as auto-publish, pinned by golden-value tests), concurrency-capped, wall-clock budgeted, ordered least-recently-verified-first so nothing starves, with batched writes, a persisted run summary in `activity_log`, coverage/silence alerts, and a retention prune. `posts_in_period` is a real 7-day count for the first time. The sweep no longer stamps `blogs.lastPostVerifiedAt` — that column is the auto-publish priority key. `vercel.json` deleted (two of its five schedules 404'd, two exactly duplicated Render). Migration `0045`. |
 | **T17** | Cadence integrity | One canonical `blogs.posting_plan integer[7]` replaces four disagreeing columns. New pure module `src/lib/posting-plan.ts`; publisher, verifier, pipeline-alerts, validators, CSV importer, form, admin + portal UIs all read it. Publish window narrowed to 0–17h so no blog has a single tick of runway. `?dry=1` on the auto-publish route. "No posting plan" is now a critical notification and an `activity_log` row, not a discarded JSON string. Migration `0043`; `0044_drop_legacy_cadence.sql.pending` written but inert. |
 
-### Remaining: 18
+### Remaining: 12
 
 Grouped by the phase plan; ordering follows T00's dependency map.
-
-**Phase 2 — pipeline integrity (1)**
-
-| | Task | Current state |
-|---|---|---|
-| **T15** | IndexNow + sitemaps | Still one shared `INDEXNOW_KEY` network-wide. Sitemap submission now exists via T04's `gsc-verifier`; the IndexNow half is open |
 
 **Phase 3 — content & targeting (7)**
 
@@ -213,6 +208,20 @@ These block acceptance and nobody but a human can do them.
   `/api/cron/yoast-meta-backfill?blogId=<uuid>&dryRun=1` reports the real damage
   without writing; drop `dryRun` to repair. Only sweep the network once one blog
   shows `stillBroken: 0`. It skips un-bridged blogs by default.
+- **T15 — roll out the second MU-plugin.** `docs/indexnow/netgrid-indexnow.php`
+  goes at `wp-content/mu-plugins/netgrid-indexnow.php`. Without it a site has
+  no spec-compliant key file and every IndexNow ping is rejected — but now it
+  is *recorded* as rejected instead of looking fine. `docs/indexnow/README.md`
+  has the install and verification commands.
+- **T15 — run `npm run db:backfill-indexnow` (dry run first).** It mints
+  per-blog keys, deletes the junk "IndexNow Verification" page the old code
+  published on every Shopify storefront, and prints the MU-plugin worklist.
+  **Then delete `INDEXNOW_KEY` from Render** — in that order, because the old
+  value is the only way to find the junk media uploads it names.
+- **T15 — the service account needs Full user on each Search Console
+  property.** `sitemaps.submit` returns 403 with no useful hint otherwise, and
+  Restricted is not enough. The property must already be verified by a human;
+  the API cannot verify one.
 - **T19, when you get to it, needs a communications plan.** It makes
   client-facing scores drop sharply. T00 §4 is explicit that it should be
   scheduled, not shipped opportunistically.
@@ -234,6 +243,7 @@ The SOPs assume the next free migration is `0039`. It was not — `0039` is
 | `0046_keyword_pipeline_scale.sql` | T10 |
 | `0047_yoast_meta_verification.sql` | T14 |
 | `0048_semantic_linking_refresh.sql` | T16 |
+| `0049_indexnow_per_blog_keys.sql` | T15 |
 | `0044_drop_legacy_cadence.sql.pending` | T17 follow-up — **inert**, the runner globs `*.sql` |
 
 If you apply an SOP verbatim, **check the highest existing file first.**
@@ -250,8 +260,11 @@ Flagged deliberately rather than quietly left.
 - **Held posts send their keyword target to a terminal `failed`** (T07),
   matching the neighbouring publish-failure path. That is the ledger-draining
   bug T10 owns; this deliberately did not diverge ahead of that fix.
-- **`shopifyCredsFromBlog` is duplicated** between `index-now-deployer.ts` and
-  `gsc-verifier.ts`. T04 §11 assigns the consolidation to T15.
+- **`shopifyCredsFromBlog` is now one implementation** in
+  `src/lib/services/shopify-creds.ts` (T04 assigned this to T15). The nullable
+  `shopify_auth_mode` defaulting to `client_credentials` was being re-derived
+  at four sites; getting it wrong in one silently breaks auth for every
+  legacy-token store in that subsystem.
 - **The `netgrid-gsc` and `netgrid-seo` theme markers must stay distinct.**
   Both write into the same Shopify theme assets and are kept apart only by
   their marker strings. Generalising either regex to `netgrid-\w+` would make

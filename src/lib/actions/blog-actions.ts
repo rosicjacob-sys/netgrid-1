@@ -77,6 +77,7 @@ import {
 } from "@/lib/services/platform-client";
 import * as wp from "@/lib/services/wp-client";
 import { pingIndexNowFireAndForget } from "@/lib/services/index-now-pinger";
+import { ensureSitemapSubmitted } from "@/lib/services/indexing-onboarding";
 import { scanPostAfterPublishFireAndForget } from "@/lib/services/post-seo-runner";
 import { relinkAfterPublishFireAndForget } from "@/lib/services/semantic-linking";
 import { resolveNicheConfig } from "@/lib/content/niche-config-db";
@@ -542,6 +543,14 @@ export async function createBlog(data: unknown) {
         console.error("Search Console provisioning threw:", gscErr);
       }
     })();
+
+    // Get this blog's sitemap into Search Console (T15). Fire-and-forget for
+    // the same reason as the block above; the daily /api/cron/index-submit
+    // sweep is the durable path and picks this up if the floating promise is
+    // cut short when the request ends.
+    void ensureSitemapSubmitted(inserted.id).catch((err) => {
+      console.error("[gsc] onboarding sitemap submit threw:", err);
+    });
 
     revalidatePath("/blogs");
     return { id: inserted.id };
@@ -1804,7 +1813,7 @@ export async function publishGeneratedPost(
         .from(blogs)
         .where(eq(blogs.id, post.blogId));
       if (fullBlog) {
-        pingIndexNowFireAndForget(fullBlog, result.postUrl);
+        pingIndexNowFireAndForget(fullBlog, result.postUrl, generatedPostId);
       } else {
         console.warn(
           `[indexnow] SKIP — could not reload blog row for ping`,

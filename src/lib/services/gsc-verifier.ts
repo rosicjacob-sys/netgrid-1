@@ -3,14 +3,20 @@
  *
  * WHY THIS IS NOT A COPY OF index-now-deployer.ts
  * -----------------------------------------------
- * IndexNow lets the key file live at ANY path on the host, which is exactly
- * what makes wp-client.uploadIndexNowKeyFile (media library ->
- * /wp-content/uploads/YYYY/MM/{key}.txt) and
- * shopify-client.ensureIndexNowKeyPage (a Page -> /pages/indexnow-key) work at
- * all. Google's HTML-file verification has no keyLocation field: it fetches
- * {property}/google{token}.html at the document root and nothing else. Neither
- * existing helper can write there, so the FILE method is unusable with the
- * credentials NetGrid holds.
+ * Both subsystems need a file at a URL on the customer's domain, but they
+ * cannot share a mechanism.
+ *
+ * IndexNow at least tells you WHERE it looked: the payload carries a
+ * keyLocation field. That does NOT mean any path works — the file's directory
+ * scopes what it authorises, which is why T15 had to put the key at the
+ * document root via an MU-plugin (see index-now-deployer.ts and
+ * docs/indexnow/README.md; the earlier media-library and Shopify-Page
+ * approaches authorised nothing and every ping was rejected).
+ *
+ * Google's HTML-file verification has no keyLocation equivalent at all: it
+ * fetches {property}/google{token}.html at the document root and nothing else.
+ * So the FILE method is unusable with the credentials NetGrid holds, and the
+ * per-platform methods below are what remain.
  *
  * What we do instead, per platform:
  *
@@ -49,6 +55,7 @@ import {
   type GscVerificationMethod,
 } from "@/lib/services/gsc-client";
 import { DEFAULT_API_VERSION, type ShopifyCreds } from "@/lib/services/shopify-client";
+import { shopifyCredsFromBlog } from "@/lib/services/shopify-creds";
 import {
   getMainTheme,
   getThemeAsset,
@@ -107,31 +114,6 @@ function upsertBlockInLayout(source: string, block: string): string | null {
   const headClose = /<\/head>/i;
   if (!headClose.test(source)) return null;
   return source.replace(headClose, `${block}\n</head>`);
-}
-
-/**
- * Build ShopifyCreds from a blog row. Mirrors the private helper in
- * index-now-deployer.ts; duplicated rather than imported because that function
- * is not exported. T15 consolidates the two.
- */
-function shopifyCredsFromBlog(blog: Blog): ShopifyCreds | null {
-  if (!blog.shopifyStoreUrl) return null;
-  const mode = blog.shopifyAuthMode ?? "client_credentials";
-  if (mode === "legacy_token") {
-    if (!blog.shopifyAdminApiToken) return null;
-    return {
-      mode: "legacy_token",
-      storeUrl: blog.shopifyStoreUrl,
-      adminToken: blog.shopifyAdminApiToken,
-    };
-  }
-  if (!blog.shopifyClientId || !blog.shopifyClientSecret) return null;
-  return {
-    mode: "client_credentials",
-    storeUrl: blog.shopifyStoreUrl,
-    clientId: blog.shopifyClientId,
-    clientSecret: blog.shopifyClientSecret,
-  };
 }
 
 /**

@@ -245,6 +245,14 @@ services:
       # activity_log only, no email.
       - key: ALERT_EMAIL_TO
         sync: false
+      # ── Indexing (T15) ────────────────────────────────────────────────
+      # Kill switch for all IndexNow traffic. Set to "1" to stop pinging
+      # without a redeploy; skipped pings are still recorded, so the gap stays
+      # visible. Per-blog keys live in blogs.indexnow_key — the old
+      # network-wide INDEXNOW_KEY is no longer read anywhere and should be
+      # DELETED from this service after the backfill runs.
+      - key: INDEXNOW_DISABLED
+        sync: false
       - key: CRON_SECRET
         sync: false
 
@@ -676,6 +684,29 @@ services:
         value: https://netgrid-16f6.onrender.com
       - key: CRON_SECRET
         sync: false
+
+  # Indexing sweep (T15): submit missing/stale sitemaps to Google Search
+  # Console and re-verify IndexNow key files. Daily at 04:10 UTC — off the
+  # hour so it never overlaps the four auto-publish shards, and clear of the
+  # :05/:25/:45 semantic-linking runs and the :07-:52 keyword shards.
+  #
+  # This sweep is the DURABLE path for sitemap submission; the hook in
+  # createBlog is fire-and-forget and can be cut short when the request ends.
+  - type: cron
+    name: netgrid-cron-index-submit
+    runtime: docker
+    schedule: "10 4 * * *"
+    dockerfilePath: ./cron/Dockerfile
+    dockerContext: ./cron
+    envVars:
+      - key: CRON_PATH
+        value: /api/cron/index-submit?limit=25
+      - key: APP_URL
+        value: https://netgrid-16f6.onrender.com
+      - key: CRON_SECRET
+        sync: false
+      - key: CRON_MAX_TIME
+        value: "660"
 
   # ──────────────────────────────────────────────────────────────────────
   # PIPELINE ALERTS (T22) — every 30 minutes.
