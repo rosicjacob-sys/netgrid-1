@@ -14,56 +14,49 @@ them* — it does not restate the tasks.
 
 ---
 
-## ⚠️ Read this before trusting anything below
+## Verification status
 
-**Nothing on this branch has been compiled, linted or unit-tested.**
+**The branch compiles, lints, tests and builds clean.**
 
-The npm registry was unreachable from the environment this work was done in
-(`503 upstream connect error` on every attempt, direct and proxied, over
-several hours), so `npm ci` could not complete and `node_modules` does not
-exist. That means:
+The npm registry was unreachable for most of the work on this branch
+(`503 upstream connect error` on every attempt, direct and proxied), so
+everything from T07 through T16 was written without a compiler. The registry
+came back after T16 landed, and the full suite has now been run:
 
-- `npx tsc --noEmit` — **not run**
-- `npm run lint` — **not run**
-- `npm test` / `npx vitest run` — **not run**
-- `npm run build` — **not run**
-
-There are also **no CI workflows in this repository** (`.github/workflows` is
-absent), so PR #137 does not run them either.
-
-### What was done instead
-
-| Check | Coverage |
+| Check | Result |
 |---|---|
-| TypeScript **syntactic + grammar** diagnostics on every changed file | All pass. This is `ts.createProgram(...).getSyntacticDiagnostics()` with `noResolve`/`noLib` — it catches parse errors *and* grammar errors, but **not** type errors. |
-| The T03 HTML stripper executed against its 10 test cases | All pass, using a hand-written stand-in for the four `cheerio` calls it makes. The stand-in is not a real HTML parser. |
-| The T04 `gsc-sync` pure helpers executed against their 17 test cases | All pass (no stubs needed beyond module isolation). |
-| `render.yaml` parsed with PyYAML; service names checked unique | Pass, 20 services. |
-| `package.json` re-parsed as JSON after editing | Pass. |
-| The T17 `posting-plan` helpers executed against their 17 test cases | All pass, under a hand-written vitest shim (`describe`/`it`/`expect`), not vitest itself. |
-| The T17 CSV cadence parser executed against its 11 test cases | All pass, same shim. |
-| The T18 cadence + sharding helpers executed against their 23 test cases | All pass, same shim. Includes golden shard values proving the extraction out of `content-generation-actions.ts` moved no blog between shards. |
-| The T10 ccTLD mapping executed against its 4 test cases | All pass, same shim. |
-| The T16 canonical-URL rewriter executed against its 6 test cases | All pass, same shim. One of them caught a real pre-existing bug — see below. |
-| The T14 head parser + match rules executed against their 14 test cases | All pass, under the shim with a scope-aware cheerio stand-in (not a real HTML parser). |
-| `docs/wordpress/netgrid-seo-bridge.php` linted with `php -l` | Pass — the one thing in this branch checked by a real compiler. |
+| `npm ci` | **Was broken.** T04 added `googleapis` to `package.json` without regenerating the lockfile, so `npm ci` — which Render's build command uses — failed with `EUSAGE ... Missing: googleapis@144.0.0 from lock file`. Fixed by committing the regenerated `package-lock.json`. |
+| `npx tsc --noEmit` | Clean. Two real errors found and fixed — see below. |
+| `npm run lint` | Clean, no warnings. |
+| `npx vitest run` | 22 files, 277 tests, all passing. |
+| `npm run build` | Succeeds. |
 
-That process **did** catch three real defects that would have failed the build
-or corrupted data — see [Bugs found while implementing](#bugs-found-while-implementing).
-It is still not a green build.
+### What the compiler caught that the hand-rolled checks did not
 
-### Before this is deployed, someone must run
+The substitute checks used while the registry was down (TypeScript *syntactic*
+diagnostics plus executing pure functions under a vitest shim) caught three
+real defects during the work, but they cannot see types. The full compiler
+found three more:
 
-```bash
-npm ci
-npx tsc --noEmit
-npm run lint
-npm test
-npm run build
-```
+1. **`npm ci` was broken on this branch** — the lockfile/manifest mismatch
+   above. This would have failed the Render build on the next deploy,
+   regardless of any code change.
+2. **`gsc-sync/route.ts` — `provisioned` used before assignment** (T04).
+   Declared as a bare `let` and read inside a `verify`-gated block; TS cannot
+   see that correspondence.
+3. **`wp-client.ts` — `META_NOT_LIVE` was not in `PipelineErrorCode`** (T14).
+   The new telemetry code was emitted but never added to the union.
 
-Plus the `psql` probes and live smoke tests in the acceptance sections of
-T03 §8, T04 §8 and T08 §8. **Do not deploy on the strength of this document.**
+A stale `tsconfig.tsbuildinfo` initially masked the third one after it was
+fixed — `incremental: true` is set in `tsconfig.json`, so delete that file if a
+type error survives an edit that plainly fixes it.
+
+### Still not verified by any of this
+
+`tsc`/`lint`/`vitest`/`build` prove the code is internally consistent. They say
+nothing about behaviour against live systems. The acceptance sections of each
+SOP — the `psql` probes and the live smoke tests — are still outstanding, and
+the operator actions below are still required.
 
 ---
 
@@ -78,7 +71,7 @@ T03 §8, T04 §8 and T08 §8. **Do not deploy on the strength of this document.*
 | **T06** | Token clamp / truncation | `content-token-budget.ts` + `DEEPSEEK_MAX_OUTPUT_TOKENS` |
 | **T22** | Pipeline telemetry | `cron_runs`, `pipeline_errors`, `alert_log`, `/api/admin/pipeline-health` |
 
-### Done this session (unverified — see the warning above)
+### Done this session
 
 | | Task | What landed |
 |---|---|---|

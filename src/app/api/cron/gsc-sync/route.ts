@@ -80,7 +80,11 @@ export async function GET(request: Request) {
   try {
     // Provisioning first: a blog verified in this pass is eligible for the sync
     // in the same run, which makes onboarding one cron tick rather than two.
-    let provisioned;
+    // Explicitly initialised: TS narrows an unassigned `let` to
+    // "used before being assigned" at the read sites below, which only run
+    // when `verify` is set — the compiler cannot see that correspondence.
+    let provisioned: Awaited<ReturnType<typeof provisionPendingProperties>> | undefined =
+      undefined;
     if (verify) {
       provisioned = await provisionPendingProperties(
         clampInt(url.searchParams.get("verifyLimit"), 1, 200, 50),

@@ -64,6 +64,9 @@ export const PIPELINE_ERROR_CODES = [
   "INTERNAL_LINKS_UNAVAILABLE",
   "META_WRITE_FAILED",
   "META_WRITE_SKIPPED",
+  // T14: the write was accepted but the LIVE page does not render it. Distinct
+  // from META_WRITE_FAILED, which is the plugin API rejecting the call.
+  "META_NOT_LIVE",
   "META_WRITE_UNVERIFIED",
   "INDEXNOW_KEY_MISSING",
   "INDEXNOW_DEPLOY_FAILED",
