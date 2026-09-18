@@ -1,0 +1,14 @@
+-- T17 follow-up — drops the legacy cadence columns superseded by
+-- blogs.posting_plan (migration 0043).
+--
+-- NOT APPLIED. The migration runner globs *.sql, so the .pending extension
+-- keeps this file inert. Rename it to 0044_drop_legacy_cadence.sql only AFTER
+-- the T17 §8.4 seven-day soak query has been clean for a full week and the
+-- LEGACY DUAL-WRITE blocks have been deleted from
+-- src/lib/actions/blog-actions.ts. Once this runs there is no rollback to the
+-- pre-T17 code.
+
+ALTER TABLE "blogs" DROP COLUMN IF EXISTS "posting_frequency";
+ALTER TABLE "blogs" DROP COLUMN IF EXISTS "posting_frequency_days";
+ALTER TABLE "blogs" DROP COLUMN IF EXISTS "posts_per_day";
+ALTER TABLE "blogs" DROP COLUMN IF EXISTS "posting_interval_hours";

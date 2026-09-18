@@ -14,6 +14,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { ArrowLeft, ExternalLink } from "lucide-react";
+import { formatPostingPlan, normalizePostingPlan } from "@/lib/posting-plan";
 
 interface Props {
   params: { blogId: string };
@@ -107,7 +108,7 @@ export default async function PortalBlogDetailPage({ params }: Props) {
           <CardHeader className="pb-2">
             <CardDescription>Posting Schedule</CardDescription>
             <CardTitle className="text-xl">
-              {blog.postingFrequency ?? "—"}
+              {formatPostingPlan(normalizePostingPlan(blog.postingPlan))}
             </CardTitle>
           </CardHeader>
         </Card>

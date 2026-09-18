@@ -123,8 +123,11 @@ export function CsvImportDialog({ clientId }: CsvImportDialogProps) {
         <DialogHeader>
           <DialogTitle>Import Blogs from CSV</DialogTitle>
           <DialogDescription>
-            Upload a CSV file to bulk-import blogs. Expected columns: domain, wp_url,
-            wp_username, wp_app_password, seo_plugin, posting_frequency
+            Upload a CSV file to bulk-import blogs. Required columns: domain,
+            wp_url, wp_username, wp_app_password, seo_plugin. Cadence: either
+            posting_days (e.g. &quot;Mon Wed Fri&quot;, optionally with
+            posts_per_day) or posting_frequency (e.g. &quot;3 per week&quot;,
+            &quot;2 per day&quot;). A bare number is rejected — state the unit.
           </DialogDescription>
         </DialogHeader>
 

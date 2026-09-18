@@ -93,7 +93,7 @@ function Field({
   errors,
   valueAsNumber,
 }: FieldProps) {
-  // `name` may resolve to a nested path like `postingFrequencyDays.0` because
+  // `name` may resolve to a nested path like `postingDays.0` because
   // the schema includes array fields. We only render <Field> for top-level
   // string/string-optional fields, so a string-indexed lookup is safe — but
   // TS can't narrow that from `Path<CreateBlogInput>`. Cast to a generic
@@ -142,15 +142,15 @@ export function BlogForm({
   const [testResult, setTestResult] = useState<TestResult>({ kind: "idle" });
   const [homepageSeoPushing, setHomepageSeoPushing] = useState(false);
 
-  // Coerce existing posting days into a clean array. Handles the migration
-  // case where some rows may still come through as a single number.
-  const initialPostingDays: number[] = Array.isArray(
-    defaultValues?.postingFrequencyDays,
-  )
-    ? (defaultValues!.postingFrequencyDays as number[])
-    : typeof defaultValues?.postingFrequencyDays === "number"
-      ? [defaultValues.postingFrequencyDays as number]
-      : [];
+  // Posting days come from planToFormValues() on the server (see the blog
+  // detail page), so they are already a clean ISO-weekday array.
+  const initialPostingDays: number[] = Array.isArray(defaultValues?.postingDays)
+    ? (defaultValues!.postingDays as number[])
+    : [];
+  const initialPostsPerDay: number =
+    typeof defaultValues?.postsPerDay === "number" && defaultValues.postsPerDay > 0
+      ? defaultValues.postsPerDay
+      : 1;
 
   const form = useForm<CreateBlogInput>({
     // Cast required because zod's z.infer (CreateBlogInput) is the OUTPUT type
@@ -174,9 +174,10 @@ export function BlogForm({
       shopifyAdminApiToken: defaultValues?.shopifyAdminApiToken || "",
       shopifyClientId: defaultValues?.shopifyClientId || "",
       shopifyClientSecret: defaultValues?.shopifyClientSecret || "",
-      // Frequency is hardcoded to "weekly" — the picker now drives the schedule
-      postingFrequency: "weekly",
-      postingFrequencyDays: initialPostingDays,
+      // Cadence: the day picker plus a per-day count. blog-actions.ts combines
+      // them into the canonical blogs.posting_plan.
+      postingDays: initialPostingDays,
+      postsPerDay: initialPostsPerDay,
       status: defaultValues?.status || "active",
       notesInternal: defaultValues?.notesInternal || "",
       city: defaultValues?.city || "",
@@ -198,7 +199,7 @@ export function BlogForm({
   } = form;
 
   const platform = watch("platform");
-  const selectedDays = (watch("postingFrequencyDays") as number[] | undefined) ?? [];
+  const selectedDays = (watch("postingDays") as number[] | undefined) ?? [];
   const domainValue = watch("domain");
   // Suggestion only — never written to the form until the operator types it
   // themselves. See lib/content/brand.ts for why this can't be authoritative.
@@ -208,12 +209,12 @@ export function BlogForm({
   );
 
   const toggleDay = (day: number) => {
-    const current = (getValues("postingFrequencyDays") as number[] | undefined) ?? [];
+    const current = (getValues("postingDays") as number[] | undefined) ?? [];
     const next = current.includes(day)
       ? current.filter((d) => d !== day)
       : [...current, day].sort((a, b) => a - b);
 
-    setValue("postingFrequencyDays", next as CreateBlogInput["postingFrequencyDays"], {
+    setValue("postingDays", next as CreateBlogInput["postingDays"], {
       shouldValidate: true,
       shouldDirty: true,
     });
@@ -240,8 +241,6 @@ export function BlogForm({
       shopifyAdminApiToken: !isShopify ? undefined : data.shopifyAdminApiToken,
       shopifyClientId: !isShopify ? undefined : data.shopifyClientId,
       shopifyClientSecret: !isShopify ? undefined : data.shopifyClientSecret,
-      // Force frequency to "weekly" — UI doesn't expose other options
-      postingFrequency: "weekly",
     };
 
     startTransition(async () => {
@@ -643,22 +642,19 @@ export function BlogForm({
         <CardHeader>
           <CardTitle>Posting Configuration</CardTitle>
           <CardDescription>
-            Weekly schedule — pick which days posts should go out.
+            Pick the days posts go out, and how many per day. An active blog
+            must have at least one day selected.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
-          <div className="space-y-2">
-            <div className="flex items-baseline justify-between gap-2">
-              <Label>Frequency</Label>
-              <span className="text-xs text-muted-foreground">
-                Weekly (fixed)
-              </span>
-            </div>
-            <p className="text-sm text-muted-foreground">
-              All blogs run on a weekly cadence. Use the picker below to choose
-              which days of the week to publish on.
-            </p>
-          </div>
+          <Field
+            label="Posts per selected day"
+            name="postsPerDay"
+            type="number"
+            placeholder="1"
+            register={register}
+            errors={errors}
+          />
 
           <div className="space-y-2">
             <Label>Posting Days</Label>
@@ -684,8 +680,9 @@ export function BlogForm({
               })}
             </div>
             {selectedDays.length === 0 ? (
-              <p className="text-xs text-muted-foreground">
-                No days selected — this blog won&apos;t be auto-scheduled.
+              <p className="text-xs text-destructive">
+                No days selected — this blog will never publish and cannot be
+                saved as Active.
               </p>
             ) : (
               <p className="text-xs text-muted-foreground">
@@ -700,15 +697,12 @@ export function BlogForm({
                   .join(", ")}
               </p>
             )}
-            {errors.postingFrequencyDays && (
+            {errors.postingDays && (
               <p className="text-xs text-destructive">
-                {(errors.postingFrequencyDays as { message?: string })?.message}
+                {(errors.postingDays as { message?: string })?.message}
               </p>
             )}
           </div>
-
-          {/* Hidden field — frequency is always "weekly" */}
-          <input type="hidden" {...register("postingFrequency")} value="weekly" />
         </CardContent>
       </Card>
 

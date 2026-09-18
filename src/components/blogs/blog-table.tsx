@@ -52,6 +52,7 @@ import {
 } from "@/lib/actions/blog-actions";
 import type { BlogStatus } from "@/lib/types";
 import { toast } from "sonner";
+import { formatPostingPlan, normalizePostingPlan } from "@/lib/posting-plan";
 
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -67,8 +68,7 @@ interface BlogRow {
   currentSeoScore: number | null;
   lastPostVerifiedAt: Date | null;
   lastPostTitle: string | null;
-  postingFrequency: string | null;
-  postingFrequencyDays: number[] | null;
+  postingPlan: number[];
   createdAt: Date;
 }
 
@@ -412,7 +412,7 @@ export function BlogTable({
                     {formatDate(blog.lastPostVerifiedAt)}
                   </TableCell>
                   <TableCell className="text-muted-foreground">
-                    {blog.postingFrequency || "--"}
+                    {formatPostingPlan(normalizePostingPlan(blog.postingPlan))}
                   </TableCell>
                   <TableCell>
                     <DropdownMenu>

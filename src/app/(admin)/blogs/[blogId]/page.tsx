@@ -21,6 +21,11 @@ import type { GeneratedPersona } from "@/lib/content/types";
 import { StyleProfilePanel } from "@/components/blogs/style-profile-panel";
 import { getStyleProfileForBlog } from "@/lib/actions/style-profile-actions";
 import {
+  formatPostingPlan,
+  normalizePostingPlan,
+  planToFormValues,
+} from "@/lib/posting-plan";
+import {
   ArrowLeft,
   Pencil,
   Globe,
@@ -57,15 +62,6 @@ function formatDate(value: string | Date | null): string {
     day: "numeric",
     year: "numeric",
   });
-}
-
-const WEEKDAY_SHORT = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-
-function formatPostingDays(days: number[] | null | undefined): string | null {
-  if (!days || days.length === 0) return null;
-  return days
-    .map((d) => (d >= 1 && d <= 7 ? WEEKDAY_SHORT[d - 1] : `?${d}`))
-    .join(", ");
 }
 
 function InfoRow({ label, value }: { label: string; value: string | null | undefined }) {
@@ -126,8 +122,9 @@ export default async function BlogDetailPage({
             shopifyClientId: blog.shopifyClientId || "",
             shopifyClientSecret: blog.shopifyClientSecret || "",
             // Posting cadence + status
-            postingFrequency: blog.postingFrequency || "",
-            postingFrequencyDays: blog.postingFrequencyDays ?? undefined,
+            postingDays: planToFormValues(normalizePostingPlan(blog.postingPlan)).days,
+            postsPerDay: planToFormValues(normalizePostingPlan(blog.postingPlan))
+              .postsPerDay,
             status: (blog.status as "active" | "paused" | "setup" | "decommissioned") || "active",
             notesInternal: blog.notesInternal || "",
             // Local keyword-targeted content
@@ -325,10 +322,9 @@ export default async function BlogDetailPage({
             </CardTitle>
           </CardHeader>
           <CardContent className="grid gap-4 sm:grid-cols-2">
-            <InfoRow label="Frequency" value={blog.postingFrequency} />
             <InfoRow
-              label="Posting days"
-              value={formatPostingDays(blog.postingFrequencyDays)}
+              label="Posting schedule"
+              value={formatPostingPlan(normalizePostingPlan(blog.postingPlan))}
             />
             <InfoRow
               label="Last Post Verified"

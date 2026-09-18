@@ -172,14 +172,21 @@ export const blogs = pgTable("blogs", {
   shopifyBlogHandle: varchar("shopify_blog_handle", { length: 255 }),
   shopifyGrantedScopes: text("shopify_granted_scopes"),
 
+  // CANONICAL CADENCE. integer[7]; entry i = posts to publish on ISO weekday
+  // i+1 (1 = Mon ... 7 = Sun), UTC. All-zeros = "not scheduled", which is an
+  // alertable condition (see /api/notifications), never a silent skip.
+  // The publisher and the verification cron both read THIS and nothing else.
+  // See src/lib/posting-plan.ts and migration 0043_posting_plan.sql.
+  postingPlan: integer("posting_plan")
+    .array()
+    .notNull()
+    .default(sql`'{0,0,0,0,0,0,0}'::integer[]`),
+  // -- LEGACY cadence columns. Superseded by postingPlan; retained only so a
+  //    code rollback still has data to read. Dropped by migration 0044.
+  //    Nothing may READ these any more.
   postingFrequency: varchar("posting_frequency", { length: 50 }),
   postingFrequencyDays: integer("posting_frequency_days").array(),
-  // Sub-day cadence. Daily quota (e.g. 2 = max 2 posts per UTC day). Takes
-  // precedence over postingFrequencyDays when set.
   postsPerDay: integer("posts_per_day"),
-  // Minimum hours between consecutive posts on this blog. e.g. with
-  // postsPerDay=2 and postingIntervalHours=6: post #1 at T+0, post #2 at T+6h,
-  // then wait for the next UTC day.
   postingIntervalHours: integer("posting_interval_hours"),
   lastPostVerifiedAt: timestamp("last_post_verified_at"),
   lastPostTitle: varchar("last_post_title", { length: 500 }),

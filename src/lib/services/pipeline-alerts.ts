@@ -170,28 +170,28 @@ export async function evaluateAlerts(): Promise<FiredAlert[]> {
     t6.deepseek + t6.claude >= 50 ? await currentContentModel() : "auto";
   fired.push(...evaluateRateRules(t6, t24, contentModel));
 
-  // 10. Per-blog silence — the complement of the rate alerts. postsPerDay
-  //     takes precedence over the weekday list (see isBlogDueForPost), so the
-  //     expected interval is derived the same way here.
+  // 10. Per-blog silence — the complement of the rate alerts. Derived from
+  //     the SAME canonical cadence the publisher schedules against
+  //     (blogs.posting_plan, T17): expected interval = 168h / posts-per-week.
+  //     Blogs with an empty plan are excluded — they cannot publish at all,
+  //     which is reported as `unscheduled_blogs`, not as silence.
   const silent = await db.execute(sql`
     WITH cadence AS (
       SELECT
         b.id,
         b.domain,
-        CASE
-          WHEN b.posts_per_day IS NOT NULL AND b.posts_per_day > 0
-            THEN 24.0 / b.posts_per_day
-          WHEN b.posting_frequency_days IS NOT NULL
-            AND array_length(b.posting_frequency_days, 1) > 0
-            THEN 168.0 / array_length(b.posting_frequency_days, 1)
-          ELSE 168.0
-        END AS expected_hours,
+        168.0 / GREATEST(
+          b.posting_plan[1] + b.posting_plan[2] + b.posting_plan[3]
+          + b.posting_plan[4] + b.posting_plan[5] + b.posting_plan[6]
+          + b.posting_plan[7],
+          1
+        ) AS expected_hours,
         (SELECT max(gp.published_at)
            FROM generated_posts gp
           WHERE gp.blog_id = b.id AND gp.status = 'published') AS last_published
       FROM blogs b
       WHERE b.status = 'active'
-        AND (b.posting_frequency IS NOT NULL OR b.posting_frequency_days IS NOT NULL)
+        AND b.posting_plan <> '{0,0,0,0,0,0,0}'::integer[]
     )
     SELECT id, domain, expected_hours,
            EXTRACT(EPOCH FROM (now() - last_published)) / 3600 AS hours_since

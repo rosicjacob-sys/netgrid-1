@@ -94,10 +94,16 @@ export async function GET(request: Request) {
     );
   }
 
+  // ?dry=1 builds the eligibility queue and returns it without generating
+  // or publishing anything. Used to inspect cadence decisions on production
+  // data. The Render cron services never pass it.
+  const dryRun = url.searchParams.get("dry") === "1";
+
   try {
     const result = await runAutoPublishCron({
       shardIndex: shard ?? undefined,
       shardCount: shardCount ?? undefined,
+      dryRun,
     });
     return NextResponse.json(result);
   } catch (error) {

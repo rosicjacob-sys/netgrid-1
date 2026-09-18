@@ -34,6 +34,15 @@ import {
   type ClaimedKeywordTarget,
 } from "@/lib/actions/keyword-target-actions";
 import { isTransientFailure, utcDayKey } from "@/lib/content/publish-slots";
+import { logActivity } from "@/lib/services/activity-logger";
+import {
+  formatPostingPlan,
+  isoWeekdayUtc,
+  normalizePostingPlan,
+  postsPerWeek,
+  quotaForDate,
+  WEEKDAY_NAMES,
+} from "@/lib/posting-plan";
 import { ctaColorHex } from "@/lib/content/cta-colors";
 import { resolveNextPostLanguage } from "@/lib/content/post-language";
 import { getAppBaseUrl } from "@/lib/services/link-tracker";
@@ -160,30 +169,11 @@ async function countClaimedSlotsForDay(
 }
 
 /**
- * Parse the blogs.posting_frequency varchar as a positive integer = posts per
- * UTC day. Accepts plain numbers ("2") or patterns like "2x per day", "2/day",
- * "2 posts per day". Anything else (e.g. "3x per week") returns null and the
- * caller falls back to posting_frequency_days.
+ * Safety floor between two publishes on the same blog. The auto-publish cron
+ * ticks hourly (render.yaml: "0 * * * *"), so this is what actually spaces
+ * multi-post days apart, and it also stops a manual cron poke from shipping
+ * two posts back-to-back.
  */
-function parsePostsPerDay(value: string | null | undefined): number | null {
-  if (!value) return null;
-  const trimmed = value.trim();
-  if (!trimmed) return null;
-
-  const direct = Number(trimmed);
-  if (Number.isInteger(direct) && direct > 0) return direct;
-
-  const match = trimmed.match(/(\d+)\s*(?:x|\/|\s)*(?:posts?\s*)?(?:per\s*)?day/i);
-  if (match) {
-    const n = parseInt(match[1], 10);
-    if (Number.isInteger(n) && n > 0) return n;
-  }
-  return null;
-}
-
-/** The cron runs every 6 hours, so same-day posts are naturally spaced at
- * least this far apart. We also enforce it in code so manual cron pokes can't
- * ship two posts back-to-back. */
 const MIN_HOURS_BETWEEN_POSTS = 6;
 
 /**
@@ -211,19 +201,36 @@ const MAX_BLOGS_PER_CRON_RUN = Number(
 void process.env.AUTO_PUBLISH_INTER_BLOG_DELAY_MS; // legacy env, no longer read
 
 /**
- * Deterministic preferred publishing hour (0-23 UTC) for a blog, derived
- * from its UUID. Same blog ⇒ same hour, forever. This is what spreads
- * publishes across the day so multiple due blogs don't all hit the
- * Shopify / Anthropic / Google APIs in the same minute.
+ * Width of the daily publishing window, in hourly cron ticks.
  *
- *   blog A (uuid c26a8…) → hour 9    (publishes at 09:00 UTC on its days)
- *   blog B (uuid f12d3…) → hour 14   (publishes at 14:00 UTC on its days)
- *   blog C (uuid 4a9b2…) → hour 22   (publishes at 22:00 UTC on its days)
+ * Preferred hours are drawn from 0..PUBLISH_WINDOW_HOURS-1 rather than 0..23
+ * so that EVERY blog has several ticks of runway before the UTC day rolls
+ * over. With the old 0..23 range a blog hashed to hour 23 had exactly one
+ * chance per scheduled day; if that tick was over the per-run cap, or the
+ * function deadline cut the run short, the post was lost until the next
+ * matching weekday (the cadence policy is strict day-only, no catch-up — see
+ * isBlogDueForPost). At 18 the worst slot still gets 7 ticks.
+ *
+ * Raising this back toward 24 re-introduces the starvation; lowering it
+ * increases per-hour publish density. 18 keeps peak in-flight publishes
+ * (4 shards x AUTO_PUBLISH_CONCURRENCY) inside the API headroom.
+ */
+const PUBLISH_WINDOW_HOURS = 18;
+
+/**
+ * Deterministic preferred publishing hour (0..PUBLISH_WINDOW_HOURS-1 UTC)
+ * for a blog, derived from its UUID. Same blog => same hour, forever. This
+ * is what spreads publishes across the day so multiple due blogs don't all
+ * hit the Shopify / Anthropic / Google APIs in the same minute.
+ *
+ *   blog A (uuid c26a8...) -> hour 9    (publishes at 09:00 UTC on its days)
+ *   blog B (uuid f12d3...) -> hour 14   (publishes at 14:00 UTC on its days)
+ *   blog C (uuid 4a9b2...) -> hour 4    (publishes at 04:00 UTC on its days)
  *
  * The cron only considers a blog due once the current hour has reached or
  * passed the blog's preferred hour. Late cron runs (cron paused, server
- * restart, etc.) still catch up — a blog scheduled for 09:00 that the
- * cron sees at 14:00 still gets published, because 14 ≥ 9.
+ * restart, etc.) still catch up within the same UTC day — a blog scheduled
+ * for 09:00 that the cron sees at 14:00 still gets published, because 14 >= 9.
  */
 function preferredHourForBlog(blogId: string): number {
   const hex = crypto
@@ -231,7 +238,7 @@ function preferredHourForBlog(blogId: string): number {
     .update(blogId)
     .digest("hex")
     .slice(0, 8);
-  return parseInt(hex, 16) % 24;
+  return parseInt(hex, 16) % PUBLISH_WINDOW_HOURS;
 }
 
 /**
@@ -262,35 +269,29 @@ type DueDecision =
   | { due: false; reason: string };
 
 /**
- * Cadence eligibility — does NOT check the per-client total cap (that needs a
- * separate query, done in runAutoPublishCron).
+ * Cadence eligibility against the canonical posting plan. Does NOT check the
+ * per-client total cap (that needs a separate query, done in
+ * runAutoPublishCron).
  *
- * Logic:
- *   - If blogs.posting_frequency parses to a positive integer (= posts/day):
- *     today's published count must be < that number, AND
- *     lastPostVerifiedAt must be >= MIN_HOURS_BETWEEN_POSTS ago.
- *   - Else if blogs.posting_frequency_days is set (e.g. [2,5] = Tue/Fri):
- *     current weekday must be in the array AND no post already published
- *     today AND MIN_HOURS_BETWEEN_POSTS safety floor against the last post.
- *   - Else: not auto-publishable.
+ * blogs.posting_plan is an integer[7]: entry i = posts wanted on ISO weekday
+ * i+1, UTC. See src/lib/posting-plan.ts. This single field replaced
+ * posting_frequency / posting_frequency_days / posts_per_day, which used to
+ * be three sources of truth that disagreed.
+ *
+ * Order of checks:
+ *   1. Empty plan            -> not schedulable. Should be unreachable here:
+ *                               runAutoPublishCron filters empty plans out at
+ *                               the DB layer and alerts on them separately.
+ *                               Kept as a belt-and-braces guard.
+ *   2. Today's quota is 0    -> today is not one of the blog's weekdays.
+ *   3. Quota already met     -> enough posts for today already shipped.
+ *   4. MIN_HOURS_BETWEEN_POSTS safety floor against the real last publish.
+ *
+ * Semantics are unchanged from the previous day-array behaviour: a plan of
+ * [1,0,1,0,1,0,0] permits exactly one post on Mon/Wed/Fri. A plan of
+ * [2,2,2,2,2,2,2] permits two per day, six hours apart — which is what the
+ * old "2 posts per day" posting_frequency string did.
  */
-/** ISO weekday (1 = Monday … 7 = Sunday) from a Date in UTC. */
-function isoWeekdayUtc(d: Date): number {
-  const day = d.getUTCDay(); // 0 = Sunday … 6 = Saturday
-  return ((day + 6) % 7) + 1; // 1 = Mon … 7 = Sun
-}
-
-const WEEKDAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-
-function formatWeekdayList(days: number[]): string {
-  return days.map((d) => WEEKDAY_NAMES[d - 1] ?? `?${d}`).join(", ");
-}
-
-// daysSinceLastPost + maxGapDaysForWeekdays were used by the catch-up
-// path that bypassed the day filter when a blog missed its scheduled
-// day. Removed — the platform now enforces a strict day-only policy:
-// the only way a blog publishes is if today is in its configured days.
-
 function isBlogDueForPost(
   blog: typeof blogs.$inferSelect,
   todaysPublishedCount: number,
@@ -307,81 +308,53 @@ function isBlogDueForPost(
   const last = lastPublishedAt;
   const hour = 1000 * 60 * 60;
 
-  const postsPerDay = parsePostsPerDay(blog.postingFrequency);
-  const configuredDays = Array.isArray(blog.postingFrequencyDays)
-    ? blog.postingFrequencyDays
-    : null;
-  const hasDayFilter = configuredDays !== null && configuredDays.length > 0;
+  const plan = normalizePostingPlan(blog.postingPlan);
 
-  // PRIORITY: when posting_frequency_days is set, it is THE day filter.
-  // The legacy posting_frequency field (parsed by parsePostsPerDay) only
-  // owns the schedule when posting_frequency_days is empty. This stops
-  // legacy/CSV data with posting_frequency="1" or "2x per day" from
-  // bypassing the weekday picker the operator configured in the form.
-  if (postsPerDay !== null && !hasDayFilter) {
-    if (todaysPublishedCount >= postsPerDay) {
-      return {
-        due: false,
-        reason: `daily cap hit (${todaysPublishedCount}/${postsPerDay} today)`,
-      };
-    }
-    if (last) {
-      const hoursSince = (now.getTime() - last.getTime()) / hour;
-      if (hoursSince < MIN_HOURS_BETWEEN_POSTS) {
-        return {
-          due: false,
-          reason: `${hoursSince.toFixed(1)}h since last post < ${MIN_HOURS_BETWEEN_POSTS}h interval`,
-        };
-      }
-    }
-    return { due: true };
+  // 1. No schedule at all. This is a configuration fault, not a routine
+  //    skip — runAutoPublishCron reports it as `unscheduledActiveBlogs`
+  //    and /api/notifications raises it as a critical item.
+  if (postsPerWeek(plan) === 0) {
+    return {
+      due: false,
+      reason:
+        "no posting plan configured — blogs.posting_plan is empty; " +
+        "set posting days on the blog before activating it",
+    };
   }
 
-  // postingFrequencyDays is an integer[] of ISO weekdays (e.g. [2,5] = Tue/Fri).
-  // Semantics: strict day-only — the blog publishes only when today
-  // matches one of the configured weekdays. No catch-up, no bypass,
-  // no exceptions. If a scheduled day is missed (cron outage, paused
-  // blog, etc.) the blog simply waits for the next matching weekday.
-  if (hasDayFilter && configuredDays) {
-    const today = isoWeekdayUtc(now);
+  const today = isoWeekdayUtc(now);
+  const quotaToday = quotaForDate(plan, now);
 
-    // 1. Strict day filter. Today MUST be a configured weekday.
-    if (!configuredDays.includes(today)) {
-      return {
-        due: false,
-        reason: `today is ${WEEKDAY_NAMES[today - 1]}; configured days are [${formatWeekdayList(configuredDays)}]`,
-      };
-    }
-
-    // 2. Already posted today? Block re-publish — one post per
-    //    configured day.
-    if (todaysPublishedCount > 0) {
-      return {
-        due: false,
-        reason: `already published today (${todaysPublishedCount} post${todaysPublishedCount === 1 ? "" : "s"})`,
-      };
-    }
-
-    // 3. Safety floor against rapid-fire posts (cron poke / manual
-    //    trigger races). Never publish twice within 6 hours, even on
-    //    consecutive configured days.
-    if (last) {
-      const hoursSince = (now.getTime() - last.getTime()) / hour;
-      if (hoursSince < MIN_HOURS_BETWEEN_POSTS) {
-        return {
-          due: false,
-          reason: `${hoursSince.toFixed(1)}h since last post < ${MIN_HOURS_BETWEEN_POSTS}h safety floor`,
-        };
-      }
-    }
-
-    return { due: true };
+  // 2. Strict day filter. Today MUST carry a non-zero quota. No catch-up,
+  //    no bypass: a missed day waits for the next scheduled weekday.
+  if (quotaToday === 0) {
+    return {
+      due: false,
+      reason: `today is ${WEEKDAY_NAMES[today - 1]}; scheduled days are [${formatPostingPlan(plan)}]`,
+    };
   }
 
-  return {
-    due: false,
-    reason: "no cadence configured (set posting_frequency or posting_frequency_days)",
-  };
+  // 3. Daily quota.
+  if (todaysPublishedCount >= quotaToday) {
+    return {
+      due: false,
+      reason: `daily quota hit (${todaysPublishedCount}/${quotaToday} today)`,
+    };
+  }
+
+  // 4. Safety floor against rapid-fire posts (cron poke / manual trigger
+  //    races, and the gap between two posts on a multi-post day).
+  if (last) {
+    const hoursSince = (now.getTime() - last.getTime()) / hour;
+    if (hoursSince < MIN_HOURS_BETWEEN_POSTS) {
+      return {
+        due: false,
+        reason: `${hoursSince.toFixed(1)}h since last post < ${MIN_HOURS_BETWEEN_POSTS}h safety floor`,
+      };
+    }
+  }
+
+  return { due: true };
 }
 
 /**
@@ -655,8 +628,8 @@ export async function runGenerateAndPublish(
   //    transaction is simply not available here.
   //
   //    day_slot exists because a blog may legitimately publish more than
-  //    once a day: parsePostsPerDay() accepts "2x per day" and
-  //    isBlogDueForPost permits todaysPublishedCount < postsPerDay. Slot n
+  //    once a day: a posting_plan entry may be greater than 1, and
+  //    isBlogDueForPost permits todaysPublishedCount < that quota. Slot n
   //    is the (n+1)-th post of the day. countClaimedSlotsForDay counts only
   //    rows that already hold a slot for this day, so two racing processes
   //    always compute the SAME next slot and exactly one wins the insert.
@@ -1603,13 +1576,30 @@ export interface AutoPublishResult {
   /** In-flight rows released at the start of this sweep. */
   reaped: ReapResult;
   deferred: number; // due but capped this run; will run next cron tick
+  /**
+   * Active blogs — network-wide, NOT shard-filtered — whose posting_plan is
+   * empty. These can never publish and are excluded from the candidate query
+   * entirely. This is a configuration fault, surfaced as a critical item in
+   * /api/notifications and as an activity_log row written by shard 0.
+   */
+  unscheduledActiveBlogs: number;
+  /** Domains of those blogs, capped at 25 so the log line stays readable. */
+  unscheduledDomains: string[];
+  /** True when ?dry=1 was passed: the queue was built but nothing published. */
+  dryRun: boolean;
   currentHourUtc: number;
   maxPerRun: number;
   results: Array<{
     blogId: string;
     domain: string;
     preferredHour: number;
-    status: "published" | "generated" | "failed" | "skipped" | "deferred";
+    status:
+      | "published"
+      | "generated"
+      | "failed"
+      | "skipped"
+      | "deferred"
+      | "dry_run";
     message: string;
   }>;
   /**
@@ -1632,8 +1622,8 @@ export interface AutoPublishResult {
  *   1. Load all active blogs with cadence configured, joined to client.
  *   2. For each blog, determine eligibility:
  *        a. Client total-posts cap (clients.totalBlogsTarget)
- *        b. Cadence: today's weekday is in postingFrequencyDays AND not
- *           already published today
+ *        b. Cadence: today's entry in blogs.posting_plan is non-zero AND
+ *           today's published count is below it (see isBlogDueForPost)
  *        c. Time-of-day slot: current UTC hour ≥ preferredHourForBlog(blogId).
  *           This spreads publishes naturally across the day — a blog whose
  *           slot is 09:00 UTC waits until the cron sees hour 9, then is
@@ -1711,6 +1701,12 @@ export async function runAutoPublishCron(
     shardIndex?: number;
     /** Total number of parallel cron services. Default 1 = no sharding. */
     shardCount?: number;
+    /**
+     * Build the eligibility queue and return it WITHOUT publishing anything.
+     * Used to inspect cadence decisions safely (T17 SOP section 8.3).
+     * Reached via /api/cron/auto-publish?dry=1.
+     */
+    dryRun?: boolean;
   } = {},
 ): Promise<AutoPublishResult> {
   const { shardIndex, shardCount } = resolveShard(opts);
@@ -1727,7 +1723,7 @@ export async function runAutoPublishCron(
 }
 
 async function runAutoPublishCronInner(
-  opts: { shardIndex?: number; shardCount?: number } = {},
+  opts: { shardIndex?: number; shardCount?: number; dryRun?: boolean } = {},
 ): Promise<AutoPublishResult> {
   const now = new Date();
   const todayStart = startOfUtcDay(now);
@@ -1740,9 +1736,11 @@ async function runAutoPublishCronInner(
   //    would skip that blog for the rest of the UTC day.
   const reaped = await reapStuckPublishes();
 
-  // 1. Active blogs with at least one cadence field set. Sort at the DB
-  //    layer by lastPostVerifiedAt ASC NULLS FIRST so we can stream
-  //    longest-waiting first without an in-memory sort pass.
+  // 1. Active blogs that have a real schedule. Blogs with an empty
+  //    posting_plan are EXCLUDED here rather than loaded and skipped every
+  //    hour — they are counted and alerted on separately below.
+  //    Sort at the DB layer by lastPostVerifiedAt ASC NULLS FIRST so we can
+  //    stream longest-waiting first without an in-memory sort pass.
   const rows = await db
     .select({
       blog: blogs,
@@ -1761,13 +1759,51 @@ async function runAutoPublishCronInner(
         // the day it deployed (Aug 31). Onboarding clients have always
         // published; paused is the only exclusion.
         ne(clients.status, "paused"),
-        or(isNotNull(blogs.postingFrequency), isNotNull(blogs.postingFrequencyDays)),
+        sql`${blogs.postingPlan} <> '{0,0,0,0,0,0,0}'::integer[]`,
       ),
     )
     .orderBy(
       sql`${blogs.lastPostVerifiedAt} ASC NULLS FIRST`,
       asc(blogs.id),
     );
+
+  // 1b. The alertable condition: active blogs that can never publish.
+  //     Network-wide on purpose — this is a configuration fault, not a
+  //     per-shard workload figure. Uses the blogs_unscheduled_idx partial
+  //     index added by 0043_posting_plan.sql. Paused clients are excluded
+  //     for the same reason they are excluded above: their blogs are not
+  //     meant to be publishing, so an empty plan there is not a fault.
+  const unscheduledRows = await db
+    .select({ id: blogs.id, domain: blogs.domain })
+    .from(blogs)
+    .innerJoin(clients, eq(blogs.clientId, clients.id))
+    .where(
+      and(
+        eq(blogs.status, "active"),
+        ne(clients.status, "paused"),
+        sql`${blogs.postingPlan} = '{0,0,0,0,0,0,0}'::integer[]`,
+      ),
+    )
+    .orderBy(asc(blogs.domain));
+
+  // Only shard 0 reports, so four hourly cron services don't quadruple the
+  // log noise and the activity_log rows.
+  if (shardIndex === 0 && unscheduledRows.length > 0) {
+    const domains = unscheduledRows.map((r) => r.domain);
+    console.warn(
+      `[auto-publish][ALERT] ${unscheduledRows.length} active blog(s) have no ` +
+        `posting plan and will never publish: ${domains.slice(0, 25).join(", ")}` +
+        (domains.length > 25 ? `, +${domains.length - 25} more` : ""),
+    );
+    await logActivity({
+      action: "auto_publish_unscheduled",
+      entityType: "blog",
+      details: {
+        count: unscheduledRows.length,
+        domains: domains.slice(0, 50),
+      },
+    });
+  }
 
   // 2. Per-client + per-blog usage counters.
   const clientCounts = await db
@@ -1962,11 +1998,25 @@ async function runAutoPublishCronInner(
   //    Anything beyond MAX_BLOGS_PER_CRON_RUN is "deferred" — those
   //    blogs become eligible again on the next cron tick.
   queue.sort((a, b) => {
-    // Oldest real-publish first (null = never published → goes first).
-    // Uses our publish history, not the verification timestamp.
-    const aLast = a.lastPublishedAt?.getTime() ?? 0;
-    const bLast = b.lastPublishedAt?.getTime() ?? 0;
-    if (aLast !== bLast) return aLast - bLast;
+    // 1. Oldest publish DAY first (null = never published → goes first).
+    //    Bucketing to the UTC day rather than the exact timestamp is what
+    //    makes the runway tie-break below actually fire: two blogs that
+    //    both last published "on Tuesday" now compare equal here.
+    const aDay = a.lastPublishedAt
+      ? startOfUtcDay(a.lastPublishedAt).getTime()
+      : 0;
+    const bDay = b.lastPublishedAt
+      ? startOfUtcDay(b.lastPublishedAt).getTime()
+      : 0;
+    if (aDay !== bDay) return aDay - bDay;
+    // 2. Least runway left today first. A blog whose slot is 17h has one
+    //    tick before the UTC day rolls over and its scheduled day is gone
+    //    (strict day-only cadence, no catch-up); a blog whose slot is 2h
+    //    has fifteen. Highest preferred hour therefore goes first.
+    if (a.preferredHour !== b.preferredHour) {
+      return b.preferredHour - a.preferredHour;
+    }
+    // 3. Stable tie-break.
     return a.blog.id.localeCompare(b.blog.id);
   });
   const toRun = queue.slice(0, MAX_BLOGS_PER_CRON_RUN);
@@ -1993,6 +2043,41 @@ async function runAutoPublishCronInner(
         )
         .join(" | ")}`,
     );
+  }
+
+  // 4b. Dry run: report what WOULD happen and stop. Nothing is generated,
+  //     nothing is published, no counters move.
+  if (opts.dryRun) {
+    for (const entry of toRun) {
+      results.push({
+        blogId: entry.blog.id,
+        domain: entry.blog.domain,
+        preferredHour: entry.preferredHour,
+        status: "dry_run",
+        message: `would publish (plan ${formatPostingPlan(
+          normalizePostingPlan(entry.blog.postingPlan),
+        )}, slot ${entry.preferredHour}h UTC)`,
+      });
+    }
+    return {
+      considered: shardCount > 1 ? shardFilteredRows.length : rows.length,
+      ...(shardCount > 1
+        ? { totalActiveBlogs: rows.length, shardIndex, shardCount }
+        : {}),
+      due: queue.length,
+      published: 0,
+      failed: 0,
+      skipped,
+      claimLost: 0,
+      reaped,
+      deferred: deferredQueue.length,
+      unscheduledActiveBlogs: unscheduledRows.length,
+      unscheduledDomains: unscheduledRows.slice(0, 25).map((r) => r.domain),
+      dryRun: true,
+      currentHourUtc: currentHour,
+      maxPerRun: MAX_BLOGS_PER_CRON_RUN,
+      results,
+    };
   }
 
   // 5. Process the run queue with a concurrency-capped worker pool.
@@ -2177,6 +2262,9 @@ async function runAutoPublishCronInner(
     claimLost,
     reaped,
     deferred: deferredQueue.length,
+    unscheduledActiveBlogs: unscheduledRows.length,
+    unscheduledDomains: unscheduledRows.slice(0, 25).map((r) => r.domain),
+    dryRun: false,
     currentHourUtc: currentHour,
     maxPerRun: MAX_BLOGS_PER_CRON_RUN,
     results,

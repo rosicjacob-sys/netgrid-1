@@ -6,23 +6,21 @@ import { eq, and, desc, sql } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 import { requireAdmin } from "@/lib/auth/helpers";
 import { fetchRecentPosts } from "@/lib/services/platform-client";
+import { normalizePostingPlan, postsPerWeek } from "@/lib/posting-plan";
 
 type BlogRow = typeof blogs.$inferSelect;
 
 /**
- * Total expected posts per 7-day window, regardless of which cadence system
- * the blog uses. Returns 0 when no schedule is configured.
- *
- * - `postsPerDay` (newer system) takes precedence: e.g. 2/day → 14/week.
- * - Otherwise, `postingFrequencyDays` is an *array* (e.g. [1,3,5] for
- *   Mon/Wed/Fri) and its length is the weekly count.
+ * Total expected posts per 7-day window, read from the SAME canonical field
+ * the auto-publish cron schedules against (blogs.posting_plan). Returns 0
+ * when the blog has no schedule, which makes maxDaysBetweenPosts() return 0
+ * and computeOnSchedule() return true — an unscheduled blog is never flagged
+ * "behind" here. It is reported instead as `unscheduled_blogs`, a critical
+ * item in /api/notifications, because "no schedule" is a configuration fault
+ * and not a missed post.
  */
 function expectedPostsPerWeek(blog: BlogRow): number {
-  if (blog.postsPerDay && blog.postsPerDay > 0) return blog.postsPerDay * 7;
-  if (Array.isArray(blog.postingFrequencyDays)) {
-    return blog.postingFrequencyDays.length;
-  }
-  return 0;
+  return postsPerWeek(normalizePostingPlan(blog.postingPlan));
 }
 
 /**
