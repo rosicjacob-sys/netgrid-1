@@ -34,6 +34,8 @@ import {
   type ClaimedKeywordTarget,
 } from "@/lib/actions/keyword-target-actions";
 import { isTransientFailure, utcDayKey } from "@/lib/content/publish-slots";
+import { shardForBlog } from "@/lib/cron/sharding";
+import { blogHasCredentials } from "@/lib/cron/cadence";
 import { logActivity } from "@/lib/services/activity-logger";
 import {
   formatPostingPlan,
@@ -114,20 +116,6 @@ export interface GenerateAndPublishResult {
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
-
-function blogHasCredentials(blog: typeof blogs.$inferSelect): boolean {
-  if (blog.platform === "shopify") {
-    if (!blog.shopifyStoreUrl) return false;
-    // Two auth modes:
-    //   legacy_token       — needs shopifyAdminApiToken
-    //   client_credentials — needs shopifyClientId + shopifyClientSecret
-    // Default to client_credentials when the column is null (matches the DB default).
-    const mode = blog.shopifyAuthMode ?? "client_credentials";
-    if (mode === "legacy_token") return Boolean(blog.shopifyAdminApiToken);
-    return Boolean(blog.shopifyClientId && blog.shopifyClientSecret);
-  }
-  return Boolean(blog.wpUrl && blog.wpUsername && blog.wpAppPassword);
-}
 
 /** Start of the current UTC day (used for the per-day cap). */
 function startOfUtcDay(now: Date): Date {
@@ -239,28 +227,6 @@ function preferredHourForBlog(blogId: string): number {
     .digest("hex")
     .slice(0, 8);
   return parseInt(hex, 16) % PUBLISH_WINDOW_HOURS;
-}
-
-/**
- * Stable shard assignment for a blog — same blog ⇒ same shard, forever.
- * Used to partition the active blog pool across parallel auto-publish
- * cron services. Each service is configured with (shardIndex, shardCount)
- * via query string and only processes blogs where:
- *
- *   shardForBlog(blog.id, shardCount) === shardIndex
- *
- * Uses bytes 8-15 of the SHA1 hex (different than preferredHourForBlog
- * which uses bytes 0-7) so a blog's shard assignment is independent of
- * its hour assignment.
- */
-function shardForBlog(blogId: string, shardCount: number): number {
-  if (shardCount <= 1) return 0;
-  const hex = crypto
-    .createHash("sha1")
-    .update(blogId)
-    .digest("hex")
-    .slice(8, 16);
-  return parseInt(hex, 16) % shardCount;
 }
 
 /** Reason a blog is or isn't due. */

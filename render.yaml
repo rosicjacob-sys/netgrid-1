@@ -155,6 +155,34 @@ services:
       # and its day slot released (T08). 3x the longest legitimate lifetime.
       - key: PUBLISH_REAPER_MINUTES
         value: "30"
+      # ── Post-verification sweep (T18) ─────────────────────────────────
+      # Read by /api/cron/post-verification. These belong on the WEB
+      # service: a cron service's env vars are consumed by curl in the cron
+      # container and never reach the request handler. Anything the handler
+      # needs per-shard travels in CRON_PATH's query string instead.
+      - key: POST_VERIFICATION_CONCURRENCY
+        value: "6"
+      - key: POST_VERIFICATION_LIMIT
+        value: "600"
+      # Stop dispatching new blogs at 240s. Must stay below maxDuration
+      # (300s) which must stay below CRON_MAX_TIME (330s).
+      - key: POST_VERIFICATION_BUDGET_MS
+        value: "240000"
+      - key: POST_VERIFICATION_RETENTION_DAYS
+        value: "30"
+      - key: POST_VERIFICATION_PRUNE_BATCH
+        value: "5000"
+      # Alert thresholds. Coverage is verified/eligible per shard.
+      - key: POST_VERIFICATION_MIN_COVERAGE_PCT
+        value: "90"
+      - key: POST_VERIFICATION_BEHIND_ALERT
+        value: "10"
+      - key: POST_VERIFICATION_SILENT_DAYS
+        value: "14"
+      # Ops inbox for coverage / silent-blog alerts. Unset = log +
+      # activity_log only, no email.
+      - key: ALERT_EMAIL_TO
+        sync: false
       - key: CRON_SECRET
         sync: false
 
@@ -198,21 +226,92 @@ services:
       - key: CRON_MAX_TIME
         value: "360"
 
-  # Post verification — every 6h aligned to PH morning: 02 / 08 / 14 / 20 PH.
+  # ──────────────────────────────────────────────────────────────────────
+  # POST VERIFICATION — 4-way SHARDED, same hash partition as auto-publish
+  # (shardForBlog in src/lib/cron/sharding.ts). Every blog is in exactly one
+  # shard, so no blog is checked twice and none is skipped.
+  #
+  # Every 6h, aligned to PH morning: 02 / 08 / 14 / 20 PH.
   # 02 PH = 18 UTC (prev day), 08 PH = 00 UTC, 14 PH = 06 UTC, 20 PH = 12 UTC.
+  #
+  # Minutes 05/07/09/11 rather than :00 — the four auto-publish shards fire
+  # on the hour and can each run for up to 600s, and semantic-linking runs
+  # at :20. Minutes 5-11 are otherwise unused.
+  #
+  # Capacity (1,500 active blogs, concurrency 6 set on the WEB service):
+  #   375 blogs per shard; ~56s typical, ~190s pessimistic per run.
+  #   Server-side budget 240s < maxDuration 300s < CRON_MAX_TIME 330s.
+  #
+  # CRON_MAX_TIME MUST stay above the route's own budget: cron/invoke.sh
+  # runs curl with retries, and curl treats --max-time expiry as a transient
+  # error, so a too-small value produces OVERLAPPING sweeps instead of one
+  # clean failure. That is what the previous unsharded service did.
+  #
+  # Shard 0 also runs the post_verifications retention prune.
+  # ──────────────────────────────────────────────────────────────────────
   - type: cron
-    name: netgrid-cron-post-verification
+    name: netgrid-cron-post-verification-0
     runtime: docker
-    schedule: "0 0,6,12,18 * * *"
+    schedule: "5 0,6,12,18 * * *"
     dockerfilePath: ./cron/Dockerfile
     dockerContext: ./cron
     envVars:
       - key: CRON_PATH
-        value: /api/cron/post-verification
+        value: /api/cron/post-verification?shard=0&shardCount=4
       - key: APP_URL
         value: https://netgrid-16f6.onrender.com
       - key: CRON_SECRET
         sync: false
+      - key: CRON_MAX_TIME
+        value: "330"
+
+  - type: cron
+    name: netgrid-cron-post-verification-1
+    runtime: docker
+    schedule: "7 0,6,12,18 * * *"
+    dockerfilePath: ./cron/Dockerfile
+    dockerContext: ./cron
+    envVars:
+      - key: CRON_PATH
+        value: /api/cron/post-verification?shard=1&shardCount=4
+      - key: APP_URL
+        value: https://netgrid-16f6.onrender.com
+      - key: CRON_SECRET
+        sync: false
+      - key: CRON_MAX_TIME
+        value: "330"
+
+  - type: cron
+    name: netgrid-cron-post-verification-2
+    runtime: docker
+    schedule: "9 0,6,12,18 * * *"
+    dockerfilePath: ./cron/Dockerfile
+    dockerContext: ./cron
+    envVars:
+      - key: CRON_PATH
+        value: /api/cron/post-verification?shard=2&shardCount=4
+      - key: APP_URL
+        value: https://netgrid-16f6.onrender.com
+      - key: CRON_SECRET
+        sync: false
+      - key: CRON_MAX_TIME
+        value: "330"
+
+  - type: cron
+    name: netgrid-cron-post-verification-3
+    runtime: docker
+    schedule: "11 0,6,12,18 * * *"
+    dockerfilePath: ./cron/Dockerfile
+    dockerContext: ./cron
+    envVars:
+      - key: CRON_PATH
+        value: /api/cron/post-verification?shard=3&shardCount=4
+      - key: APP_URL
+        value: https://netgrid-16f6.onrender.com
+      - key: CRON_SECRET
+        sync: false
+      - key: CRON_MAX_TIME
+        value: "330"
 
   # Monthly reports — 09:00 PH on the 1st of each month.
   # 09:00 PH = 01:00 UTC same day. PDFs land in client inboxes around

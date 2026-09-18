@@ -42,6 +42,7 @@ absent), so PR #137 does not run them either.
 | `package.json` re-parsed as JSON after editing | Pass. |
 | The T17 `posting-plan` helpers executed against their 17 test cases | All pass, under a hand-written vitest shim (`describe`/`it`/`expect`), not vitest itself. |
 | The T17 CSV cadence parser executed against its 11 test cases | All pass, same shim. |
+| The T18 cadence + sharding helpers executed against their 23 test cases | All pass, same shim. Includes golden shard values proving the extraction out of `content-generation-actions.ts` moved no blog between shards. |
 
 That process **did** catch three real defects that would have failed the build
 or corrupted data — see [Bugs found while implementing](#bugs-found-while-implementing).
@@ -62,7 +63,7 @@ T03 §8, T04 §8 and T08 §8. **Do not deploy on the strength of this document.*
 
 ---
 
-## Status: 9 of 26 done, 17 remaining
+## Status: 10 of 26 done, 16 remaining
 
 ### Done before this session
 
@@ -81,17 +82,17 @@ T03 §8, T04 §8 and T08 §8. **Do not deploy on the strength of this document.*
 | **T08** | Publish idempotency | `publish_day` + `day_slot` with a partial unique index; `cron/invoke.sh` retry/timeout fix; strict shard validation (400, not silent default); `reapStuckPublishes()`; `transient` on the result type so the worker-pool retry is reachable. Migration `0040`. |
 | **T03** | Link exchange shutdown | Engine hard-retired behind `LINK_EXCHANGE_RETIRED`; route returns 410 and imports nothing from the service; admin toggle refuses to re-enable; new `link-exchange-removal.ts` stripper + queue + cron. Migration `0041`. |
 | **T04** | Search Console feedback loop | `gsc-client.ts`, `gsc-verifier.ts`, `gsc-sync.ts`, `gsc-index-coverage.ts`, two cron routes, `search_performance` + `index_coverage` tables, 7 Render cron services. Migration `0042`. |
+| **T18** | Post-verification at scale | The sweep was a single unordered sequential loop over every active blog under `curl --max-time 660 --retry 3` — it never finished, and curl retried it three more times while the abandoned handler kept running. Now 4-way sharded (same hash partition as auto-publish, pinned by golden-value tests), concurrency-capped, wall-clock budgeted, ordered least-recently-verified-first so nothing starves, with batched writes, a persisted run summary in `activity_log`, coverage/silence alerts, and a retention prune. `posts_in_period` is a real 7-day count for the first time. The sweep no longer stamps `blogs.lastPostVerifiedAt` — that column is the auto-publish priority key. `vercel.json` deleted (two of its five schedules 404'd, two exactly duplicated Render). Migration `0045`. |
 | **T17** | Cadence integrity | One canonical `blogs.posting_plan integer[7]` replaces four disagreeing columns. New pure module `src/lib/posting-plan.ts`; publisher, verifier, pipeline-alerts, validators, CSV importer, form, admin + portal UIs all read it. Publish window narrowed to 0–17h so no blog has a single tick of runway. `?dry=1` on the auto-publish route. "No posting plan" is now a critical notification and an `activity_log` row, not a discarded JSON string. Migration `0043`; `0044_drop_legacy_cadence.sql.pending` written but inert. |
 
 ### Remaining: 18
 
 Grouped by the phase plan; ordering follows T00's dependency map.
 
-**Phase 2 — pipeline integrity (5)**
+**Phase 2 — pipeline integrity (4)**
 
 | | Task | Current state |
 |---|---|---|
-| **T18** | Post-verification at scale | `runPostVerificationCron` loops serially over *all* active blogs under `maxDuration = 60` |
 | **T10** | Keyword refresh at scale + ledger draining | `markKeywordTargetFailed` is still terminal while `claimKeywordTargetForBlog` only selects `pending`. T08 stopped *adding* to the failed bucket from two paths; draining it is still open |
 | **T14** | Yoast meta no-op | `updateYoastMeta` still POSTs read-only `yoast_head_json` + unregistered `meta`. WP returns 200, writes nothing, no read-back |
 | **T15** | IndexNow + sitemaps | Still one shared `INDEXNOW_KEY` network-wide. Sitemap submission now exists via T04's `gsc-verifier`; the IndexNow half is open |
@@ -181,6 +182,22 @@ These block acceptance and nobody but a human can do them.
 - **T17 — add a Render log alert on `[auto-publish][ALERT]`** against the web
   service. Shard 0 emits it at most once an hour, only when the count is
   non-zero.
+- **T18 — delete `netgrid-cron-post-verification` in the Render dashboard.**
+  Removing a service from the blueprint does not delete it. Until someone
+  suspends it by hand it keeps firing at `0 0,6,12,18` with no shard
+  parameters — the full unsharded sweep, on top of the four new sharded ones.
+- **T18 — confirm no Vercel deployment is live before this merges.** This
+  commit deletes `vercel.json`. Two of its five schedules pointed at routes
+  that do not exist and two exactly duplicated Render, but if some Vercel
+  deployment is serving traffic for a domain nobody mentioned, deleting the
+  file stops five jobs there rather than two duplicates here.
+- **T18 — repair `blogs.last_post_verified_at`.** The sweep has been
+  overwriting it with "time of last check" for every blog it reached; it means
+  "time of our last publish" and is the auto-publish priority key. Re-derive it
+  from `MAX(generated_posts.published_at WHERE status='published')` once, after
+  deploy. T18 §7.
+- **T18 — set `ALERT_EMAIL_TO`** on the web service, or coverage and
+  silent-blog alerts are console + `activity_log` only.
 - **T19, when you get to it, needs a communications plan.** It makes
   client-facing scores drop sharply. T00 §4 is explicit that it should be
   scheduled, not shipped opportunistically.
@@ -198,6 +215,7 @@ The SOPs assume the next free migration is `0039`. It was not — `0039` is
 | `0041_link_exchange_shutdown.sql` | T03 |
 | `0042_search_console.sql` | T04 |
 | `0043_posting_plan.sql` | T17 |
+| `0045_post_verification_retention.sql` | T18 |
 | `0044_drop_legacy_cadence.sql.pending` | T17 follow-up — **inert**, the runner globs `*.sql` |
 
 If you apply an SOP verbatim, **check the highest existing file first.**
@@ -226,6 +244,12 @@ Flagged deliberately rather than quietly left.
   code rollback has data to read. Nothing *reads* them. Delete the three
   `LEGACY DUAL-WRITE` blocks and rename `0044_...pending` one week after
   `0043` lands, not before.
+- **T18's shard parser is strict where the SOP specified lenient.** The SOP
+  collapses a malformed `?shard`/`?shardCount` to (0 of 1). That is the
+  failure mode T08 already fixed on the auto-publish route, and here it is
+  worse: a typo turns the shard filter into a no-op, so one service sweeps the
+  whole network — the unsharded run that blows through curl's `--max-time` and
+  gets retried. The route answers 400 instead, which curl does not retry.
 - **`pipeline-alerts.ts` was a fourth cadence reader the T17 SOP did not know
   about** — T22 added it after the SOP was written. Its raw-SQL silence rule
   now derives `expected_hours` from `posting_plan` like everything else. If you

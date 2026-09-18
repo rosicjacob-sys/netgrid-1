@@ -6,79 +6,20 @@ import { eq, and, desc, sql } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 import { requireAdmin } from "@/lib/auth/helpers";
 import { fetchRecentPosts } from "@/lib/services/platform-client";
-import { normalizePostingPlan, postsPerWeek } from "@/lib/posting-plan";
+import {
+  computeOnSchedule,
+  countPostsInWindow,
+  expectedPostsPerWeek,
+  fetchCountForBlog,
+  maxDaysBetweenPosts,
+} from "@/lib/cron/cadence";
+import { runPostVerificationSweep } from "@/lib/cron/post-verification";
 
-type BlogRow = typeof blogs.$inferSelect;
-
-/**
- * Total expected posts per 7-day window, read from the SAME canonical field
- * the auto-publish cron schedules against (blogs.posting_plan). Returns 0
- * when the blog has no schedule, which makes maxDaysBetweenPosts() return 0
- * and computeOnSchedule() return true — an unscheduled blog is never flagged
- * "behind" here. It is reported instead as `unscheduled_blogs`, a critical
- * item in /api/notifications, because "no schedule" is a configuration fault
- * and not a missed post.
- */
-function expectedPostsPerWeek(blog: BlogRow): number {
-  return postsPerWeek(normalizePostingPlan(blog.postingPlan));
-}
-
-/**
- * Max acceptable gap (in days) between consecutive posts before we flag the
- * blog as "off schedule". 0 means no schedule is configured (always on time).
- * Adds 1 day of grace so a near-miss isn't immediately flagged.
- */
-function maxDaysBetweenPosts(blog: BlogRow): number {
-  const epw = expectedPostsPerWeek(blog);
-  if (epw <= 0) return 0;
-  return Math.ceil(7 / epw) + 1;
-}
-
-/**
- * Decide whether a blog is "on schedule" (true) or "behind" (false).
- *
- *   maxGap === 0  → no schedule configured → always on time.
- *
- *   NEW-BLOG GRACE (checked FIRST, before any live-post logic):
- *     If WE added this blog within one cadence window (createdAt age
- *     <= maxGap), it's "on schedule" regardless of the live site's
- *     post state. We haven't had a chance to publish on our cadence
- *     yet. This covers two cases:
- *       (a) a fresh blog with no posts at all, and
- *       (b) a fresh blog on a store that already had an OLD post
- *           (e.g. a Shopify article from weeks ago) — that pre-
- *           existing content shouldn't make a just-onboarded blog
- *           look behind.
- *
- *   Past the grace window, judge by the latest LIVE post:
- *     daysSinceLastPost === null  → no posts at all → behind
- *     daysSinceLastPost <= maxGap → on schedule
- *     else                        → behind
- *
- * Once we publish our own first post, the live site shows it as the
- * latest, so daysSinceLastPost reflects OUR cadence from then on.
- */
-function computeOnSchedule(
-  blog: BlogRow,
-  daysSinceLastPost: number | null,
-  maxGap: number,
-  now: Date = new Date(),
-): boolean {
-  if (maxGap === 0) return true;
-
-  // New-blog grace — based on when WE onboarded the blog, NOT on the
-  // live site's post history.
-  if (blog.createdAt) {
-    const ageDays = Math.ceil(
-      (now.getTime() - blog.createdAt.getTime()) / (1000 * 60 * 60 * 24),
-    );
-    if (ageDays <= maxGap) return true;
-  }
-
-  // Past grace: a stale or missing live post means behind.
-  if (daysSinceLastPost === null) return false;
-  return daysSinceLastPost <= maxGap;
-}
+// NOTE: this module is "use server", so every export must be an async
+// function — Next.js turns them into callable server actions. The cadence
+// maths and the sweep itself therefore live in plain modules under
+// src/lib/cron/ and are imported here. Do not re-export the sweep's
+// interfaces from this file; import them from @/lib/cron/post-verification.
 
 export async function getPostVerifications(params?: {
   blogId?: string;
@@ -116,23 +57,28 @@ export async function getPostVerifications(params?: {
   return { records, total: count, page, pageSize };
 }
 
+/**
+ * Verify ONE blog on demand (admin UI / debugging). Uses exactly the same
+ * maths as the sweep — same cadence source, same rolling-window count — so a
+ * manual check can never disagree with the scheduled one.
+ */
 export async function verifyBlogPosts(blogId: string) {
   await requireAdmin();
 
   const [blog] = await db.select().from(blogs).where(eq(blogs.id, blogId)).limit(1);
   if (!blog) throw new Error("Blog not found");
 
-  const posts = await fetchRecentPosts(blog, 5);
-
+  const now = new Date();
+  const expected = expectedPostsPerWeek(blog);
+  const posts = await fetchRecentPosts(blog, fetchCountForBlog(expected));
   const latestPost = posts[0];
   const latestPostDate = latestPost?.publishedAt ?? null;
   const daysSinceLastPost = latestPostDate
-    ? Math.ceil((Date.now() - latestPostDate.getTime()) / (1000 * 60 * 60 * 24))
+    ? Math.ceil((now.getTime() - latestPostDate.getTime()) / (1000 * 60 * 60 * 24))
     : null;
-
-  const expected = expectedPostsPerWeek(blog);
+  const postsInPeriod = countPostsInWindow(posts, now);
   const maxGap = maxDaysBetweenPosts(blog);
-  const onSchedule = computeOnSchedule(blog, daysSinceLastPost, maxGap);
+  const onSchedule = computeOnSchedule(blog, daysSinceLastPost, maxGap, now);
   const alertTriggered = !onSchedule;
 
   const [verification] = await db.insert(postVerifications).values({
@@ -142,91 +88,52 @@ export async function verifyBlogPosts(blogId: string) {
     latestPostDate,
     latestPostTitle: latestPost?.title || null,
     latestPostUrl: latestPost?.url || null,
-    postsInPeriod: posts.length,
+    postsInPeriod,
     expectedPosts: expected,
     onSchedule,
     daysSinceLastPost,
     alertTriggered,
+    checkedAt: now,
   }).returning();
 
-  await db.update(blogs).set({
-    lastPostVerifiedAt: new Date(),
-    lastPostTitle: latestPost?.title || blog.lastPostTitle,
-    updatedAt: new Date(),
-  }).where(eq(blogs.id, blogId));
+  // Only lastPostTitle. blogs.lastPostVerifiedAt means "when did WE last
+  // publish" — it is the auto-publish priority key and is written by the
+  // publish path alone. A verification must not advance it.
+  if (latestPost?.title && latestPost.title !== blog.lastPostTitle) {
+    await db.update(blogs).set({
+      lastPostTitle: latestPost.title,
+      updatedAt: now,
+    }).where(eq(blogs.id, blogId));
+  }
 
+  revalidatePath(`/blogs/${blogId}`);
   return verification;
 }
 
 /**
- * Admin-callable wrapper for the post-verification sweep. Same logic as the
- * cron, but auth-gated and revalidates the /posts page so the table updates
- * once the job finishes.
+ * Admin-callable wrapper for the post-verification sweep. Same code path as
+ * the cron, but auth-gated and revalidating /posts so the table updates once
+ * the job finishes.
+ *
+ * Defaults to a SINGLE shard covering the whole network. From a browser
+ * request that will usually exceed the sweep's own budget on a 1,500-blog
+ * network and return partial coverage — which is correct and safe (the
+ * unreached blogs sort first next run). Pass a shard explicitly to check one
+ * quarter of the network, or a small `limit` to spot-check.
  */
-export async function runPostVerificationNow() {
+export async function runPostVerificationNow(options?: {
+  shardIndex?: number;
+  shardCount?: number;
+  limit?: number;
+  concurrency?: number;
+}) {
   await requireAdmin();
-  const result = await runPostVerificationCron();
+  const result = await runPostVerificationSweep({
+    ...options,
+    checkType: "manual",
+    // Never prune from an ad-hoc admin run; the scheduled shard 0 owns it.
+    prune: false,
+  });
   revalidatePath("/posts");
   return result;
-}
-
-// Called by cron job
-export async function runPostVerificationCron() {
-  const activeBlogs = await db.select().from(blogs).where(eq(blogs.status, "active"));
-
-  let verified = 0;
-  let alerts = 0;
-
-  for (const blog of activeBlogs) {
-    const hasWp = blog.wpUrl && blog.wpUsername && blog.wpAppPassword;
-    // Shopify supports two auth modes; either is sufficient.
-    const shopifyMode = blog.shopifyAuthMode ?? "client_credentials";
-    const hasShopify =
-      blog.shopifyStoreUrl &&
-      (shopifyMode === "legacy_token"
-        ? Boolean(blog.shopifyAdminApiToken)
-        : Boolean(blog.shopifyClientId && blog.shopifyClientSecret));
-    if (blog.platform === "wordpress" && !hasWp) continue;
-    if (blog.platform === "shopify" && !hasShopify) continue;
-
-    try {
-      const posts = await fetchRecentPosts(blog, 5);
-      const latestPost = posts[0];
-      const latestPostDate = latestPost?.publishedAt ?? null;
-      const daysSinceLastPost = latestPostDate
-        ? Math.ceil((Date.now() - latestPostDate.getTime()) / (1000 * 60 * 60 * 24))
-        : null;
-
-      const expected = expectedPostsPerWeek(blog);
-      const maxGap = maxDaysBetweenPosts(blog);
-      const onSchedule = computeOnSchedule(blog, daysSinceLastPost, maxGap);
-      const alertTriggered = !onSchedule;
-      if (alertTriggered) alerts++;
-
-      await db.insert(postVerifications).values({
-        blogId: blog.id,
-        clientId: blog.clientId,
-        checkType: "scheduled",
-        latestPostDate,
-        latestPostTitle: latestPost?.title || null,
-        latestPostUrl: latestPost?.url || null,
-        postsInPeriod: posts.length,
-        expectedPosts: expected,
-        onSchedule,
-        daysSinceLastPost,
-        alertTriggered,
-      });
-
-      await db.update(blogs).set({
-        lastPostVerifiedAt: new Date(),
-        lastPostTitle: latestPost?.title || blog.lastPostTitle,
-      }).where(eq(blogs.id, blog.id));
-
-      verified++;
-    } catch (error) {
-      console.error(`Post verification failed for ${blog.domain}:`, error);
-    }
-  }
-
-  return { verified, alerts, total: activeBlogs.length };
 }
