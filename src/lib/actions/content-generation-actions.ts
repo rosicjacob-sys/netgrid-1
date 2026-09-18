@@ -1065,16 +1065,28 @@ export async function runGenerateAndPublish(
         },
       });
     }
+    // What the LIVE page actually rendered after the meta write (T14).
+    // null means "could not check" — Shopify, or the page was unreachable.
+    const seoMetaVerified = publish.seoMetaVerified ?? null;
     await db
       .update(generatedPosts)
       .set({
         status: "published",
         externalPostId: publish.postId != null ? String(publish.postId) : null,
         externalPostUrl: publish.postUrl ?? null,
+        seoMetaVerified,
+        seoMetaVerifiedAt: seoMetaVerified === null ? null : publishedAt,
         publishedAt,
         updatedAt: publishedAt,
       })
       .where(eq(generatedPosts.id, generatedPostId));
+
+    if (seoMetaVerified === false) {
+      console.error(
+        `[auto-publish] SEO META NOT LIVE for ${blog.domain} post ` +
+          `${publish.postId} (${publish.postUrl}): ${publish.seoMetaMessage ?? "no detail"}`,
+      );
+    }
 
     await db
       .update(blogs)

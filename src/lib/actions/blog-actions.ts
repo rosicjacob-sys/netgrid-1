@@ -868,6 +868,10 @@ export async function testBlogConnection(
     if (result.seoPlugin) {
       updateData.seoPlugin = result.seoPlugin;
     }
+    // undefined => Shopify (leave alone); null => WP without the bridge (T14).
+    if (result.seoBridgeVersion !== undefined) {
+      updateData.seoBridgeVersion = result.seoBridgeVersion;
+    }
     await db.update(blogs).set(updateData).where(eq(blogs.id, id));
   }
 

@@ -44,6 +44,8 @@ absent), so PR #137 does not run them either.
 | The T17 CSV cadence parser executed against its 11 test cases | All pass, same shim. |
 | The T18 cadence + sharding helpers executed against their 23 test cases | All pass, same shim. Includes golden shard values proving the extraction out of `content-generation-actions.ts` moved no blog between shards. |
 | The T10 ccTLD mapping executed against its 4 test cases | All pass, same shim. |
+| The T14 head parser + match rules executed against their 14 test cases | All pass, under the shim with a scope-aware cheerio stand-in (not a real HTML parser). |
+| `docs/wordpress/netgrid-seo-bridge.php` linted with `php -l` | Pass — the one thing in this branch checked by a real compiler. |
 
 That process **did** catch three real defects that would have failed the build
 or corrupted data — see [Bugs found while implementing](#bugs-found-while-implementing).
@@ -64,7 +66,7 @@ T03 §8, T04 §8 and T08 §8. **Do not deploy on the strength of this document.*
 
 ---
 
-## Status: 11 of 26 done, 15 remaining
+## Status: 12 of 26 done, 14 remaining
 
 ### Done before this session
 
@@ -83,6 +85,7 @@ T03 §8, T04 §8 and T08 §8. **Do not deploy on the strength of this document.*
 | **T08** | Publish idempotency | `publish_day` + `day_slot` with a partial unique index; `cron/invoke.sh` retry/timeout fix; strict shard validation (400, not silent default); `reapStuckPublishes()`; `transient` on the result type so the worker-pool retry is reachable. Migration `0040`. |
 | **T03** | Link exchange shutdown | Engine hard-retired behind `LINK_EXCHANGE_RETIRED`; route returns 410 and imports nothing from the service; admin toggle refuses to re-enable; new `link-exchange-removal.ts` stripper + queue + cron. Migration `0041`. |
 | **T04** | Search Console feedback loop | `gsc-client.ts`, `gsc-verifier.ts`, `gsc-sync.ts`, `gsc-index-coverage.ts`, two cron routes, `search_performance` + `index_coverage` tables, 7 Render cron services. Migration `0042`. |
+| **T14** | Yoast meta no-op | Every Yoast WordPress post published with the theme's default title and no meta description, while the log said "(SEO meta set)". Three independent reasons, all returning HTTP 200. Fixed: new `docs/wordpress/netgrid-seo-bridge.php` MU-plugin registers the real `_yoast_wpseo_*` keys for REST with an `auth_callback` and refreshes Yoast's indexable cache; `updateYoastMeta` writes those keys and throws when the bridge is absent; every write is now confirmed against the live `<head>` before anything is called a success. `metaStatus: "written"` now requires live verification. Per-post result persisted on `generated_posts`, bridge version per blog, and a measure-then-repair backfill. Migration `0047`. |
 | **T10** | Keyword pipeline at scale + ledger draining | The weekly refresh scraped every client in one unordered sequential pass (~5 h at 1,500 clients), so it never returned and the ledger rebuild after it never ran at all. Now 4-way sharded, hourly, staggered, with a staleness cursor on `clients.keywords_refresh_attempted_at` stamped *before* the scrape. `markKeywordTargetFailed` no longer buries a row in `failed` on the first transient error — bounded retries with a cool-off, dead-lettering only once the budget is spent, plus a two-window reaper that respects in-flight posts. Scrape locales now come from the client's own blogs instead of guessing from `language_mode`. A blocked scrape is reported instead of looking like "no results". The DataForSEO provenance downgrade is fixed. Migration `0046`, which also releases the existing permanent graves. |
 | **T18** | Post-verification at scale | The sweep was a single unordered sequential loop over every active blog under `curl --max-time 660 --retry 3` — it never finished, and curl retried it three more times while the abandoned handler kept running. Now 4-way sharded (same hash partition as auto-publish, pinned by golden-value tests), concurrency-capped, wall-clock budgeted, ordered least-recently-verified-first so nothing starves, with batched writes, a persisted run summary in `activity_log`, coverage/silence alerts, and a retention prune. `posts_in_period` is a real 7-day count for the first time. The sweep no longer stamps `blogs.lastPostVerifiedAt` — that column is the auto-publish priority key. `vercel.json` deleted (two of its five schedules 404'd, two exactly duplicated Render). Migration `0045`. |
 | **T17** | Cadence integrity | One canonical `blogs.posting_plan integer[7]` replaces four disagreeing columns. New pure module `src/lib/posting-plan.ts`; publisher, verifier, pipeline-alerts, validators, CSV importer, form, admin + portal UIs all read it. Publish window narrowed to 0–17h so no blog has a single tick of runway. `?dry=1` on the auto-publish route. "No posting plan" is now a critical notification and an `activity_log` row, not a discarded JSON string. Migration `0043`; `0044_drop_legacy_cadence.sql.pending` written but inert. |
@@ -91,11 +94,10 @@ T03 §8, T04 §8 and T08 §8. **Do not deploy on the strength of this document.*
 
 Grouped by the phase plan; ordering follows T00's dependency map.
 
-**Phase 2 — pipeline integrity (3)**
+**Phase 2 — pipeline integrity (2)**
 
 | | Task | Current state |
 |---|---|---|
-| **T14** | Yoast meta no-op | `updateYoastMeta` still POSTs read-only `yoast_head_json` + unregistered `meta`. WP returns 200, writes nothing, no read-back |
 | **T15** | IndexNow + sitemaps | Still one shared `INDEXNOW_KEY` network-wide. Sitemap submission now exists via T04's `gsc-verifier`; the IndexNow half is open |
 | **T16** | Internal linking | `relinkAfterPublishFireAndForget` still only called from the manual path, never from auto-publish |
 
@@ -206,6 +208,17 @@ These block acceptance and nobody but a human can do them.
   it appears, halve `KEYWORD_SCRAPE_CONCURRENCY` first, then
   `KEYWORD_REFRESH_MAX_CLIENTS`. Do not "fix" it by spoofing a browser
   User-Agent — that hides the next block instead of reporting it.
+- **T14 — deploy `docs/wordpress/netgrid-seo-bridge.php` to every Yoast site.**
+  It goes at `wp-content/mu-plugins/netgrid-seo-bridge.php`, directly in that
+  directory (WordPress does not recurse into subdirectories). **Nothing in T14
+  works on a site without it** — `updateYoastMeta` now throws there instead of
+  silently succeeding, which is the point, but it means Yoast meta writes fail
+  loudly until the rollout lands. T14 §5 Step 3 covers doing this at 1,500-site
+  scale. Run a connection test afterwards to populate `blogs.seo_bridge_version`.
+- **T14 — then run the backfill, per blog, measure first.**
+  `/api/cron/yoast-meta-backfill?blogId=<uuid>&dryRun=1` reports the real damage
+  without writing; drop `dryRun` to repair. Only sweep the network once one blog
+  shows `stillBroken: 0`. It skips un-bridged blogs by default.
 - **T19, when you get to it, needs a communications plan.** It makes
   client-facing scores drop sharply. T00 §4 is explicit that it should be
   scheduled, not shipped opportunistically.
@@ -225,6 +238,7 @@ The SOPs assume the next free migration is `0039`. It was not — `0039` is
 | `0043_posting_plan.sql` | T17 |
 | `0045_post_verification_retention.sql` | T18 |
 | `0046_keyword_pipeline_scale.sql` | T10 |
+| `0047_yoast_meta_verification.sql` | T14 |
 | `0044_drop_legacy_cadence.sql.pending` | T17 follow-up — **inert**, the runner globs `*.sql` |
 
 If you apply an SOP verbatim, **check the highest existing file first.**
@@ -278,6 +292,11 @@ Flagged deliberately rather than quietly left.
   T08's version ignored `generated_post_id` and could reap a row whose post was
   mid-publish, handing the same keyword out twice. The old name survives as a
   shim so the auto-publish hot path did not change.
+- **T14's backfill requires the bridge by default**, which the SOP left as an
+  operator discipline note. Without that filter every post on an un-bridged blog
+  burns a live fetch plus a REST write, comes back `stillBroken`, and stays in
+  the candidate set — so the next run does it all again. `requireBridge=0` is
+  available for a deliberate dry-run measurement.
 - **T03's removal cron and queue table are temporary.** Delete
   `netgrid-cron-link-exchange-removal`, the route, the service file and
   `link_exchange_removals` once the queue drains and is signed off (T03 §7.7).

@@ -458,6 +458,12 @@ export async function backfillPostSeo(
     /** Shopify only — sets the article excerpt (summary_html). Ignored on WP. */
     excerptHtml?: string;
     focusKeyword?: string;
+    /**
+     * WordPress only — public URL of the post. Supplying it lets the meta
+     * write verify itself against the live page without an extra REST lookup
+     * (T14). Ignored on Shopify.
+     */
+    postUrl?: string;
   },
   shopifyBlogId?: string,
 ): Promise<PublishPostResult> {
@@ -494,6 +500,7 @@ export async function backfillPostSeo(
       metaTitle: input.metaTitle,
       metaDescription: input.metaDescription,
       focusKeyword: input.focusKeyword,
+      postUrl: input.postUrl,
     },
     blog.seoPlugin ?? "none",
   );

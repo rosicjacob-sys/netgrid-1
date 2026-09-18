@@ -8,6 +8,7 @@ import type {
   MetaWriteStatus,
 } from "@/lib/types";
 import { compressImageDataUri } from "./image-compress";
+import { verifyLiveMeta } from "./wp-meta-verify";
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -81,6 +82,26 @@ function createClient(wpUrl: string, username: string, appPassword: string): Axi
       "Content-Type": "application/json",
     },
   });
+}
+
+/**
+ * Outcome of writing SEO meta to a WordPress post (T14).
+ *
+ * `status` is the existing MetaWriteStatus the publish counters read.
+ * `verified` is the only claim worth making about whether the meta is LIVE:
+ *   true  - confirmed on the live page
+ *   false - the page was fetched and shows something else
+ *   null  - not checked (draft, no public URL, or the page was unreachable)
+ *
+ * A "written" status now requires verified === true. Everything else that was
+ * accepted by WordPress but not confirmed is "unverified", because a 2xx from
+ * a meta write proves nothing — see updateYoastMeta.
+ */
+export interface SeoMetaResult {
+  status: MetaWriteStatus;
+  verified: boolean | null;
+  plugin: SeoPlugin;
+  message: string;
 }
 
 function normalizeWpUrl(wpUrl: string): string {
@@ -206,13 +227,35 @@ export async function testConnection(
     } catch {}
   }
 
-  console.log("[wp.testConnection] success", { user: user.name, role: userRole });
+  // Is the netgrid-seo-bridge MU-plugin installed? Without it, Yoast's
+  // _yoast_wpseo_* post meta is not registered for REST and every meta write
+  // this app makes is discarded with a 200 (see updateYoastMeta). null means
+  // "not installed" — that blog still needs the T14 rollout.
+  let seoBridgeVersion: string | null = null;
+  try {
+    const client = createClient(wpUrl, username, appPassword);
+    const probe = await client.get<{ bridge_version?: string }>(
+      "/wp-json/netgrid/v1/seo-bridge",
+      { timeout: 5000, validateStatus: () => true },
+    );
+    if (probe.status < 400 && typeof probe.data?.bridge_version === "string") {
+      seoBridgeVersion = probe.data.bridge_version;
+    }
+  } catch {}
+
+  console.log("[wp.testConnection] success", {
+    user: user.name,
+    role: userRole,
+    seoPlugin,
+    seoBridgeVersion,
+  });
 
   return {
     success: true,
     message: `Connected as ${user.name} (${userRole})`,
     wpVersion: wpVersion || undefined,
     seoPlugin,
+    seoBridgeVersion,
     userRole,
   };
 }
@@ -343,11 +386,12 @@ export async function createPost(
       ...(featuredMediaId !== undefined && { featured_media: featuredMediaId }),
     });
 
-    // Write SEO meta title/description to whichever plugin the site runs.
-    // Best-effort: a meta-write failure must not fail an otherwise-published
-    // post. Sites with no SEO plugin can't accept head meta via REST, so we
-    // skip them (the theme controls <title> and emits no meta description).
-    const metaStatus = await writeWpSeoMeta(
+    // Write SEO meta title/description to whichever plugin the site runs, then
+    // CONFIRM it on the live page. A 200 from WordPress proves nothing — see
+    // writeWpSeoMeta. A meta failure must not fail an otherwise-published post,
+    // but it is now loud in the logs and carried on the result instead of being
+    // reported as "(SEO meta set)".
+    const seoMeta = await writeWpSeoMeta(
       wpUrl,
       username,
       appPassword,
@@ -358,18 +402,20 @@ export async function createPost(
         focusKeyword: input.tags?.[0],
       },
       options.seoPlugin ?? "none",
+      // Drafts have no publicly fetchable URL - skip verification for them.
+      { postUrl: wpStatus === "publish" ? res.data.link : null },
     );
 
     return {
       success: true,
       message: `Post "${res.data.title.rendered}" ${
         wpStatus === "publish" ? "published" : "saved as draft"
-      }${featuredMediaId ? " with featured image" : ""}${
-        metaStatus === "written" ? " (SEO meta set)" : ""
-      }`,
+      }${featuredMediaId ? " with featured image" : ""}${describeSeoMeta(seoMeta)}`,
       postId: res.data.id,
       postUrl: res.data.link,
-      metaStatus,
+      metaStatus: seoMeta.status,
+      seoMetaVerified: seoMeta.verified,
+      seoMetaMessage: seoMeta.message || undefined,
     };
   } catch (error) {
     return { success: false, message: formatError(error) };
@@ -377,17 +423,52 @@ export async function createPost(
 }
 
 /**
- * Write the SEO meta title/description to whichever SEO plugin the site
- * runs, after the post has been created. Returns true when meta was written.
+ * Fetch a post's public permalink and status. Used by updatePostSeo so meta
+ * verification has a URL to check when the caller did not supply one. Returns
+ * nulls on any failure - verification then reports "unverifiable" rather than
+ * failing the update.
+ */
+export async function getPostLink(
+  wpUrl: string,
+  username: string,
+  appPassword: string,
+  postId: number,
+): Promise<{ link: string | null; status: string | null }> {
+  try {
+    const client = createClient(wpUrl, username, appPassword);
+    const res = await client.get<{ link?: string; status?: string }>(
+      `/wp-json/wp/v2/posts/${postId}`,
+      {
+        params: { context: "edit", _fields: "id,link,status" },
+        validateStatus: () => true,
+      },
+    );
+    if (res.status >= 400) return { link: null, status: null };
+    return { link: res.data.link ?? null, status: res.data.status ?? null };
+  } catch {
+    return { link: null, status: null };
+  }
+}
+
+/**
+ * Write the SEO meta title/description to whichever SEO plugin the site runs,
+ * then CONFIRM it on the live page (T14).
  *
  * Routing:
- *   - "rankmath" → /rankmath/v1/updateMeta (rank_math_* fields)
- *   - "yoast"    → post update with yoast_wpseo_* meta
- *   - "none"     → no-op (a plugin-less site has no REST surface to accept
- *                  a head meta description; the theme owns <title>)
+ *   - "rankmath" -> /rankmath/v1/updateMeta (rank_math_* fields)
+ *   - "yoast"    -> post `meta` update with _yoast_wpseo_* keys, which requires
+ *                   the netgrid-seo-bridge MU-plugin on the site
+ *   - "none"     -> no-op (a plugin-less site has no REST surface for head
+ *                   meta; the theme owns <title>)
  *
- * The first tag (if any) is used as the focus keyword. Best-effort: any
- * failure is logged and swallowed so it never fails an already-published post.
+ * The first tag (if any) is used as the focus keyword.
+ *
+ * Best-effort in the sense that a meta failure never fails an already-published
+ * post - but NOT best-effort in what it reports. A 200 from WordPress is not a
+ * success (see updateYoastMeta), so the only thing that returns status
+ * "written" is a live <head> that matches. Everything accepted but unconfirmed
+ * is "unverified"; everything else is logged at error level with the post id,
+ * the site, and what the page actually shows.
  */
 async function writeWpSeoMeta(
   wpUrl: string,
@@ -396,10 +477,21 @@ async function writeWpSeoMeta(
   postId: number,
   meta: { metaTitle?: string; metaDescription?: string; focusKeyword?: string },
   seoPlugin: SeoPlugin,
-): Promise<MetaWriteStatus> {
+  options: { postUrl?: string | null; verify?: boolean } = {},
+): Promise<SeoMetaResult> {
   const metaTitle = meta.metaTitle?.trim();
   const metaDescription = meta.metaDescription?.trim();
-  if (!metaTitle && !metaDescription) return "skipped";
+
+  const skipped = (message: string): SeoMetaResult => ({
+    status: "skipped",
+    verified: null,
+    plugin: seoPlugin,
+    message,
+  });
+
+  if (!metaTitle && !metaDescription) {
+    return skipped("No meta title or description supplied");
+  }
   if (seoPlugin === "none") {
     // A plugin-less site has no REST surface that can accept a head meta
     // description. This is a real coverage gap, not a non-event — it is
@@ -412,10 +504,11 @@ async function writeWpSeoMeta(
       message: `No SEO plugin on ${wpUrl} — head meta cannot be written via REST`,
       context: { wpUrl, postId },
     });
-    return "skipped";
+    return skipped("Blog has no SEO plugin - nothing to write");
   }
 
   const focusKw = meta.focusKeyword?.trim();
+  const site = normalizeWpUrl(wpUrl);
 
   try {
     if (seoPlugin === "rankmath") {
@@ -424,29 +517,97 @@ async function writeWpSeoMeta(
         ...(metaDescription && { rank_math_description: metaDescription }),
         ...(focusKw && { rank_math_focus_keyword: focusKw }),
       });
-      return "written";
-    }
-    if (seoPlugin === "yoast") {
+    } else {
       await updateYoastMeta(wpUrl, username, appPassword, postId, {
         ...(metaTitle && { yoast_wpseo_title: metaTitle }),
         ...(metaDescription && { yoast_wpseo_metadesc: metaDescription }),
         ...(focusKw && { yoast_wpseo_focuskw: focusKw }),
       });
-      return "written";
     }
   } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
     recordPipelineError({
       site: "wp-client.writeWpSeoMeta",
       code: "META_WRITE_FAILED",
       severity: "error",
-      message: `SEO meta write failed (post still published): ${
-        err instanceof Error ? err.message : String(err)
-      }`,
+      message: `SEO meta write failed (post still published): ${detail}`,
       context: { wpUrl, postId, seoPlugin },
     });
-    return "failed";
+    console.error(
+      `[wp.seoMeta] ${seoPlugin} WRITE FAILED post=${postId} site=${site}: ${detail}`,
+    );
+    return {
+      status: "failed",
+      verified: null,
+      plugin: seoPlugin,
+      message: `SEO meta write failed: ${detail}`,
+    };
   }
-  return "skipped";
+
+  const postUrl = options.postUrl?.trim();
+  if (options.verify === false || !postUrl) {
+    return {
+      status: "unverified",
+      verified: null,
+      plugin: seoPlugin,
+      message: "SEO meta written (not verified - no public URL)",
+    };
+  }
+
+  const check = await verifyLiveMeta(postUrl, {
+    title: metaTitle,
+    description: metaDescription,
+  });
+
+  if (check.verified === true) {
+    return {
+      status: "written",
+      verified: true,
+      plugin: seoPlugin,
+      message: "SEO meta written and verified on the live page",
+    };
+  }
+
+  if (check.verified === null) {
+    console.warn(
+      `[wp.seoMeta] ${seoPlugin} UNVERIFIABLE post=${postId} url=${postUrl}: ${check.reason}`,
+    );
+    return {
+      status: "unverified",
+      verified: null,
+      plugin: seoPlugin,
+      message: `SEO meta written but unverifiable: ${check.reason}`,
+    };
+  }
+
+  // Fetched and wrong: the write did not land. This is the failure mode that
+  // used to report "(SEO meta set)".
+  recordPipelineError({
+    site: "wp-client.writeWpSeoMeta",
+    code: "META_NOT_LIVE",
+    severity: "error",
+    message: `SEO meta written but the live page does not show it: ${check.reason}`,
+    context: { wpUrl, postId, seoPlugin, postUrl, attempts: check.attempts },
+  });
+  console.error(
+    `[wp.seoMeta] ${seoPlugin} NOT LIVE post=${postId} url=${postUrl} ` +
+      `attempts=${check.attempts}: ${check.reason}`,
+  );
+  return {
+    status: "failed",
+    verified: false,
+    plugin: seoPlugin,
+    message: `SEO meta written but NOT LIVE: ${check.reason}`,
+  };
+}
+
+/** Human-readable suffix appended to publish/update messages. */
+function describeSeoMeta(result: SeoMetaResult): string {
+  if (result.status === "skipped") return "";
+  if (result.verified === true) return " (SEO meta verified live)";
+  if (result.verified === false) return " (SEO META NOT LIVE - see logs)";
+  if (result.status === "unverified") return " (SEO meta written, unverified)";
+  return " (SEO meta write FAILED)";
 }
 
 /**
@@ -545,17 +706,28 @@ export async function updatePageContent(
 }
 
 /**
- * Backfill an existing post's SEO fields: optionally replace the body
- * (after H1 demotion) and write the meta title/description to the site's
- * SEO plugin. Mirrors what createPost now does at publish time. Best-effort
- * on the meta write; a content update failure is surfaced in the result.
+ * Backfill an existing post's SEO fields: optionally replace the body (after
+ * H1 demotion) and write the meta title/description to the site's SEO plugin,
+ * then verify it on the live page. Mirrors what createPost does at publish
+ * time.
+ *
+ * Callers that already know the post's public URL should pass `input.postUrl`;
+ * otherwise one extra GET resolves it, and only when a meta write is actually
+ * going to happen.
  */
 export async function updatePostSeo(
   wpUrl: string,
   username: string,
   appPassword: string,
   postId: number,
-  input: { content?: string; metaTitle?: string; metaDescription?: string; focusKeyword?: string },
+  input: {
+    content?: string;
+    metaTitle?: string;
+    metaDescription?: string;
+    focusKeyword?: string;
+    /** Public URL of the post, if the caller already has it. */
+    postUrl?: string;
+  },
   seoPlugin: SeoPlugin,
 ): Promise<PublishPostResult> {
   try {
@@ -564,7 +736,19 @@ export async function updatePostSeo(
         content: input.content,
       });
     }
-    const metaStatus = await writeWpSeoMeta(
+
+    const willWriteMeta =
+      seoPlugin !== "none" &&
+      Boolean(input.metaTitle?.trim() || input.metaDescription?.trim());
+
+    let postUrl: string | null = input.postUrl?.trim() || null;
+    if (!postUrl && willWriteMeta) {
+      const looked = await getPostLink(wpUrl, username, appPassword, postId);
+      // Only a published post has a fetchable URL worth verifying.
+      postUrl = looked.status === "publish" ? looked.link : null;
+    }
+
+    const seoMeta = await writeWpSeoMeta(
       wpUrl,
       username,
       appPassword,
@@ -575,11 +759,16 @@ export async function updatePostSeo(
         focusKeyword: input.focusKeyword,
       },
       seoPlugin,
+      { postUrl },
     );
     return {
       success: true,
-      message: `Post ${postId} updated${metaStatus === "written" ? " (SEO meta set)" : ""}`,
+      message: `Post ${postId} updated${describeSeoMeta(seoMeta)}`,
       postId,
+      ...(postUrl ? { postUrl } : {}),
+      metaStatus: seoMeta.status,
+      seoMetaVerified: seoMeta.verified,
+      seoMetaMessage: seoMeta.message || undefined,
     };
   } catch (error) {
     return { success: false, message: formatError(error) };
@@ -922,7 +1111,45 @@ export async function getYoastMeta(
 }
 
 /**
+ * Yoast's post-meta keys. Yoast prefixes every metabox field with
+ * WPSEO_Meta::$meta_prefix ("_yoast_wpseo_"), which makes them PROTECTED meta:
+ * is_protected_meta() returns true, so map_meta_cap() refuses edit_post_meta
+ * unless the key was registered with an auth_callback.
+ *
+ * The public-facing parameter names on updateYoastMeta stay unprefixed so the
+ * existing call sites (writeWpSeoMeta, seo-autofix.ts) do not change.
+ */
+const YOAST_META_KEYS: Record<string, string> = {
+  yoast_wpseo_title: "_yoast_wpseo_title",
+  yoast_wpseo_metadesc: "_yoast_wpseo_metadesc",
+  yoast_wpseo_focuskw: "_yoast_wpseo_focuskw",
+  yoast_wpseo_canonical: "_yoast_wpseo_canonical",
+};
+
+/**
  * Update Yoast SEO metadata on a post.
+ *
+ * Writes the underscore-prefixed keys Yoast actually reads, via the standard
+ * `meta` object on /wp/v2/posts. This only works when the netgrid-seo-bridge
+ * MU-plugin is installed on the site (docs/wordpress/netgrid-seo-bridge.php) —
+ * Yoast itself registers none of these keys for REST, and WordPress discards
+ * unregistered meta keys with a 200 rather than an error.
+ *
+ * The previous implementation could not work for three independent reasons:
+ * it sent yoast_head_json (a read-only computed field with no update_callback,
+ * skipped silently by WP_REST_Controller), it sent unprefixed key names Yoast
+ * never reads, and even the right names would have been dropped because
+ * WP_REST_Meta_Fields::update_value() iterates the REGISTERED meta registry
+ * rather than the request body. All three failed with HTTP 200.
+ *
+ * Two guards against silent failure remain:
+ *   1. Non-2xx throws with the WordPress error body attached.
+ *   2. The update response carries context=edit, so its `meta` object lists the
+ *      post's registered meta. If NONE of our keys came back, the bridge is not
+ *      installed and the write was discarded — we throw and say so.
+ *
+ * NOTE: this is still not proof the meta RENDERS. Yoast serves <head> from its
+ * indexable cache. verifyLiveMeta() in wp-meta-verify.ts is the real check.
  */
 export async function updateYoastMeta(
   wpUrl: string,
@@ -936,11 +1163,40 @@ export async function updateYoastMeta(
     yoast_wpseo_canonical?: string;
   }
 ): Promise<WpPost> {
+  const payload: Record<string, string> = {};
+  for (const [publicKey, metaKey] of Object.entries(YOAST_META_KEYS)) {
+    const value = meta[publicKey as keyof typeof meta];
+    if (typeof value === "string" && value.trim()) {
+      payload[metaKey] = value.trim();
+    }
+  }
+  if (Object.keys(payload).length === 0) {
+    throw new Error("updateYoastMeta called with no writable fields");
+  }
+
   const client = createClient(wpUrl, username, appPassword);
-  const res = await client.post<WpPost>(`/wp-json/wp/v2/posts/${postId}`, {
-    yoast_head_json: meta,
-    meta,
-  });
+  const res = await client.post<WpPost & { meta?: Record<string, unknown> }>(
+    `/wp-json/wp/v2/posts/${postId}`,
+    { meta: payload },
+    { validateStatus: () => true },
+  );
+
+  if (res.status >= 400) {
+    const body = JSON.stringify(res.data ?? {}).slice(0, 300);
+    throw new Error(`Yoast meta write returned HTTP ${res.status}: ${body}`);
+  }
+
+  const echoed = res.data?.meta ?? {};
+  const sent = Object.keys(payload);
+  const landed = sent.filter((key) => key in echoed);
+  if (landed.length === 0) {
+    throw new Error(
+      `WordPress accepted the request but returned none of [${sent.join(", ")}] ` +
+        `in post.meta - the netgrid-seo-bridge MU-plugin is not installed on ` +
+        `${normalizeWpUrl(wpUrl)}, so Yoast meta is not REST-writable there.`,
+    );
+  }
+
   return res.data;
 }
 

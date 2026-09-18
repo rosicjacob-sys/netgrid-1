@@ -177,6 +177,11 @@ export const blogs = pgTable("blogs", {
   wpUsername: varchar("wp_username", { length: 255 }),
   wpAppPassword: varchar("wp_app_password", { length: 255 }),
   seoPlugin: seoPluginEnum("seo_plugin").default("none"),
+  // Version reported by the netgrid-seo-bridge MU-plugin's
+  // /wp-json/netgrid/v1/seo-bridge probe, refreshed on every connection test.
+  // NULL = not installed: Yoast's _yoast_wpseo_* meta is NOT REST-writable on
+  // this site, so meta writes there are discarded with a 200. See T14.
+  seoBridgeVersion: varchar("seo_bridge_version", { length: 20 }),
   shopifyStoreUrl: varchar("shopify_store_url", { length: 500 }),
   shopifyAdminApiToken: varchar("shopify_admin_api_token", { length: 500 }),
 
@@ -463,6 +468,14 @@ export const generatedPosts = pgTable("generated_posts", {
   // and the Shopify custom.netgrid_related_posts metafield.
   relatedPosts: jsonb("related_posts"),
   relatedLinkedAt: timestamp("related_linked_at"),
+  // ── SEO meta verification (T14) ──
+  // WordPress returns 200 for meta writes it silently discards, so a 2xx is
+  // not proof. This is what the LIVE page rendered after the write:
+  //   true  - the live <head> matched what we wrote
+  //   false - the page was fetched and did NOT match
+  //   null  - never checked (Shopify, a draft, or the page was unreachable)
+  seoMetaVerified: boolean("seo_meta_verified"),
+  seoMetaVerifiedAt: timestamp("seo_meta_verified_at"),
   generatedAt: timestamp("generated_at"),
   publishedAt: timestamp("published_at"),
   // ── Auto-publish idempotency (T08) ──
@@ -487,6 +500,10 @@ export const generatedPosts = pgTable("generated_posts", {
   index("generated_posts_client_id_idx").on(table.clientId),
   index("generated_posts_status_idx").on(table.status),
   index("generated_posts_created_at_idx").on(table.createdAt),
+  index("generated_posts_seo_meta_verified_idx").on(
+    table.blogId,
+    table.seoMetaVerified,
+  ),
   // THE idempotency guard. At most one row may occupy a given
   // (blog, UTC day, slot) while it is in flight or live. A row that fails
   // drops out of the predicate and frees its slot for a retry; 'generated'

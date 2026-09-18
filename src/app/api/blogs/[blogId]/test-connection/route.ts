@@ -41,10 +41,17 @@ export async function POST(
 
   const result = await testConnection(blog);
 
-  if (result.success && result.seoPlugin) {
+  if (result.success) {
     await db
       .update(blogs)
-      .set({ seoPlugin: result.seoPlugin, updatedAt: new Date() })
+      .set({
+        ...(result.seoPlugin ? { seoPlugin: result.seoPlugin } : {}),
+        // undefined => Shopify (leave alone); null => WP without the bridge.
+        ...(result.seoBridgeVersion !== undefined
+          ? { seoBridgeVersion: result.seoBridgeVersion }
+          : {}),
+        updatedAt: new Date(),
+      })
       .where(eq(blogs.id, blogId));
   }
 
