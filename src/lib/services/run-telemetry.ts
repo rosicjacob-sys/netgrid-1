@@ -77,6 +77,11 @@ export const PIPELINE_ERROR_CODES = [
   "AUTOCOMPLETE_FAILED",
   "ACTIVITY_LOG_FAILED",
   "PUBLISH_ATTEMPT_FAILED",
+  // T07 — a post the scrubber gate stopped before it reached the platform.
+  "SCRUBBER_PUBLISH_HELD",
+  // T08 — the auto-publish day-slot guard.
+  "PUBLISH_SLOT_CLAIM_LOST",
+  "PUBLISH_ROWS_REAPED",
   "CRON_RUN_FATAL",
 ] as const;
 
@@ -94,6 +99,12 @@ export interface RunCounters {
   failed: number;
   skipped: number;
   deferred: number;
+  /**
+   * Blogs whose UTC-day publishing slot was already held by another process
+   * — the T08 idempotency guard firing. A subset of `skipped`. Steady state
+   * is 0; anything above 0 means a cron shard was invoked twice.
+   */
+  claimLost: number;
   /** Articles whose JSON only parsed after truncation repair — the body
    * ends mid-sentence. See T06. */
   truncatedSalvaged: number;
@@ -106,6 +117,12 @@ export interface RunCounters {
   flaggedForReview: number;
   /** Scrubber returned REGENERATE_NEEDED and we published anyway. T07. */
   blockedRegenerate: number;
+  /**
+   * Posts the scrubber gate actually HELD (SCRUBBER_ENFORCEMENT=enforce).
+   * Distinct from flaggedForReview, which counts posts that tripped the
+   * scrubber whether or not enforcement stopped them. T07.
+   */
+  scrubberHeld: number;
   /** Publishes where SEO meta was not confirmed written. T14. */
   metaWriteUnverified: number;
   indexNowRejected: number;
@@ -126,12 +143,14 @@ export function emptyCounters(): RunCounters {
     failed: 0,
     skipped: 0,
     deferred: 0,
+    claimLost: 0,
     truncatedSalvaged: 0,
     jsonRepaired: 0,
     imageless: 0,
     bodyImageMissing: 0,
     flaggedForReview: 0,
     blockedRegenerate: 0,
+    scrubberHeld: 0,
     metaWriteUnverified: 0,
     indexNowRejected: 0,
     linkingSkipped: 0,

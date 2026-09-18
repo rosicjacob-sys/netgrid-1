@@ -108,6 +108,23 @@ services:
         sync: false
       - key: DATAFORSEO_MAX_RUN_COST
         sync: false
+      # Auto-publish sizing (T08). 36 blogs at concurrency 3 is 12 waves of
+      # at most 35s ~= 420s, leaving ~180s of the route's 600s maxDuration
+      # for in-tick retries and the sweep's own queries. The code default of
+      # 50 needs 595s before any retry and does not fit. Capacity at 36:
+      # 36 x 4 shards x 24h = 3,456 posts/day, well above the ~1,500/day peak
+      # this network is designed for.
+      - key: MAX_BLOGS_PER_CRON_RUN
+        value: "36"
+      # 4 shards x 3 = 12 in-flight publishes = 36 RPM against Anthropic's
+      # 50 and 24 RPM against Google's 60. Do not raise this to buy time —
+      # 4 would put Claude at 48 of 50 RPM with no margin.
+      - key: AUTO_PUBLISH_CONCURRENCY
+        value: "3"
+      # Age at which an in-flight generated_posts row is considered abandoned
+      # and its day slot released (T08). 3x the longest legitimate lifetime.
+      - key: PUBLISH_REAPER_MINUTES
+        value: "30"
       - key: CRON_SECRET
         sync: false
 
@@ -216,8 +233,16 @@ services:
         value: https://netgrid-16f6.onrender.com
       - key: CRON_SECRET
         sync: false
+      # Above the route's maxDuration of 600s, never below: a curl
+      # timeout re-invokes a handler that is still running. See T08.
       - key: CRON_MAX_TIME
-        value: "660"
+        value: "900"
+      # No retries on an hourly publish sweep. The DB guard makes a
+      # re-invocation harmless, but it still burns a 600s function slot
+      # and doubles API pressure; a missed tick is picked up an hour
+      # later by the deferred queue.
+      - key: CRON_RETRY
+        value: "0"
 
   - type: cron
     name: netgrid-cron-auto-publish-1
@@ -232,8 +257,16 @@ services:
         value: https://netgrid-16f6.onrender.com
       - key: CRON_SECRET
         sync: false
+      # Above the route's maxDuration of 600s, never below: a curl
+      # timeout re-invokes a handler that is still running. See T08.
       - key: CRON_MAX_TIME
-        value: "660"
+        value: "900"
+      # No retries on an hourly publish sweep. The DB guard makes a
+      # re-invocation harmless, but it still burns a 600s function slot
+      # and doubles API pressure; a missed tick is picked up an hour
+      # later by the deferred queue.
+      - key: CRON_RETRY
+        value: "0"
 
   - type: cron
     name: netgrid-cron-auto-publish-2
@@ -248,8 +281,16 @@ services:
         value: https://netgrid-16f6.onrender.com
       - key: CRON_SECRET
         sync: false
+      # Above the route's maxDuration of 600s, never below: a curl
+      # timeout re-invokes a handler that is still running. See T08.
       - key: CRON_MAX_TIME
-        value: "660"
+        value: "900"
+      # No retries on an hourly publish sweep. The DB guard makes a
+      # re-invocation harmless, but it still burns a 600s function slot
+      # and doubles API pressure; a missed tick is picked up an hour
+      # later by the deferred queue.
+      - key: CRON_RETRY
+        value: "0"
 
   - type: cron
     name: netgrid-cron-auto-publish-3
@@ -264,8 +305,16 @@ services:
         value: https://netgrid-16f6.onrender.com
       - key: CRON_SECRET
         sync: false
+      # Above the route's maxDuration of 600s, never below: a curl
+      # timeout re-invokes a handler that is still running. See T08.
       - key: CRON_MAX_TIME
-        value: "660"
+        value: "900"
+      # No retries on an hourly publish sweep. The DB guard makes a
+      # re-invocation harmless, but it still burns a 600s function slot
+      # and doubles API pressure; a missed tick is picked up an hour
+      # later by the deferred queue.
+      - key: CRON_RETRY
+        value: "0"
 
   # Schedule: 06:00 PH every Tuesday.
   # 06:00 PH Tue = 22:00 UTC Mon.

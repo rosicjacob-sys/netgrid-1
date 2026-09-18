@@ -1,7 +1,7 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { and, asc, eq, inArray, isNotNull, ne, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNotNull, lt, ne, sql } from "drizzle-orm";
 import { db } from "@/lib/db";
 import { blogs, blogKeywordTargets } from "@/lib/db/schema";
 import { requireAdmin } from "@/lib/auth/helpers";
@@ -309,5 +309,93 @@ export async function markKeywordTargetFailed(id: string, reason: string): Promi
       `[keyword-target] failed to mark ${id} failed:`,
       err instanceof Error ? err.message : err,
     );
+  }
+}
+
+/**
+ * Hand a claimed target straight back to the pool, untouched (T08).
+ *
+ * Used when the run that claimed it never actually started work — today the
+ * only such case is losing the day-slot race in runGenerateAndPublish, where
+ * a concurrent sweep already owns this blog's publishing slot for the UTC
+ * day. Nothing was generated, so the keyword was not covered and the row
+ * deserves its priority position back.
+ *
+ * 'pending', NOT 'failed': claimKeywordTargetForBlog only ever selects
+ * status='pending', so 'failed' is terminal and would silently drain the
+ * ledger. Draining the existing failed backlog is T10's job — this function
+ * only avoids adding to it.
+ *
+ * The status='generating' guard makes this a no-op if something else already
+ * resolved the row — never throws, the caller is on a publish hot path.
+ */
+export async function releaseKeywordTargetClaim(
+  id: string,
+  reason: string,
+): Promise<void> {
+  try {
+    await db
+      .update(blogKeywordTargets)
+      .set({
+        status: "pending",
+        failureReason: reason.slice(0, 2000),
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(blogKeywordTargets.id, id),
+          eq(blogKeywordTargets.status, "generating"),
+        ),
+      );
+  } catch (err) {
+    console.warn(
+      `[keyword-target] failed to release ${id}:`,
+      err instanceof Error ? err.message : err,
+    );
+  }
+}
+
+/**
+ * Time-based reaper for ledger rows abandoned in 'generating' by a process
+ * that died mid-run (Render restart, deploy during a sweep, OOM) (T08).
+ *
+ * Age is the only signal available: generated_post_id is not written until
+ * the post actually publishes (markKeywordTargetGenerated), so there is no
+ * link back to the generated_posts row to join against. A claim is only ever
+ * held for the ~25-35s of one generation, and the route that drives it is
+ * capped at maxDuration=600s, so the default 30-minute threshold is 3x the
+ * longest legitimate lifetime.
+ *
+ * Back to 'pending' for the same reason as releaseKeywordTargetClaim.
+ * Idempotent: the age predicate is re-evaluated per statement, so all four
+ * auto-publish shards can run this concurrently without double-counting
+ * anything that matters. Returns how many rows were released.
+ */
+export async function releaseStuckKeywordTargets(
+  thresholdMinutes = 30,
+): Promise<number> {
+  try {
+    const cutoff = new Date(Date.now() - thresholdMinutes * 60_000);
+    const rows = await db
+      .update(blogKeywordTargets)
+      .set({
+        status: "pending",
+        failureReason: `Reaped after ${thresholdMinutes}m stuck in 'generating' — the run that claimed it never finished`,
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(blogKeywordTargets.status, "generating"),
+          lt(blogKeywordTargets.updatedAt, cutoff),
+        ),
+      )
+      .returning({ id: blogKeywordTargets.id });
+    return rows.length;
+  } catch (err) {
+    console.warn(
+      "[keyword-target] stuck-target reap failed:",
+      err instanceof Error ? err.message : err,
+    );
+    return 0;
   }
 }

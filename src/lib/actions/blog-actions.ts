@@ -1,7 +1,12 @@
 "use server";
 
 import { db } from "@/lib/db";
-import { logScrubberVerdict } from "@/lib/content/scrubber";
+import {
+  logScrubberVerdict,
+  shouldHoldForReview,
+  scrubberSummary,
+  SCRUBBER_HOLD_PREFIX,
+} from "@/lib/content/scrubber";
 import { blogs, clients, generatedPosts, blogKeywordTargets } from "@/lib/db/schema";
 import { requireAdmin } from "@/lib/auth/helpers";
 import { createBlogSchema, updateBlogSchema } from "@/lib/validators/blog";
@@ -1417,6 +1422,37 @@ export async function generateBlogPost(
   });
 
   revalidatePath(`/blogs/${input.blogId}/posts`);
+
+  // 5b. THE GATE (T07), manual half. Applied HERE rather than inside
+  //     publishGeneratedPost on purpose: that action is also how a reviewer
+  //     RELEASES a held draft from the review queue, so gating it would make
+  //     held posts unreleasable. What must be gated is the automatic hop —
+  //     "Generate post" / "Trigger posts" with autoPublish, which is a
+  //     machine decision to go live, exactly like the cron.
+  if (
+    input.autoPublish &&
+    shouldHoldForReview(result.flaggedForReview ?? false)
+  ) {
+    const heldMessage = `${SCRUBBER_HOLD_PREFIX} ${scrubberSummary(result.scrubberReport)}`;
+    await db
+      .update(generatedPosts)
+      .set({
+        status: "generated",
+        failureReason: heldMessage,
+        updatedAt: new Date(),
+      })
+      .where(eq(generatedPosts.id, pending.id));
+    console.warn(`[scrubber-gate] held ${blog.domain} post=${pending.id}: ${heldMessage}`);
+    revalidatePath(`/blogs/${input.blogId}/posts`);
+    return {
+      success: true,
+      generatedPostId: pending.id,
+      publishResult: {
+        success: false,
+        message: `${heldMessage} — review and publish it manually to override.`,
+      },
+    };
+  }
 
   // 6. Optional immediate publish
   if (input.autoPublish) {
