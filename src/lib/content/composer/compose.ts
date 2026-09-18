@@ -209,6 +209,7 @@ export const KNOWN_PLACEHOLDER_TOKENS: readonly string[] = [
   "{citation.style}",
   "{citation.example}",
   "{schema.json}",
+  "{brand}",
   "{tag_set.allowed_tags}",
   "{compliance.placement}",
   "{compliance.phrases_rendered}",
@@ -252,6 +253,15 @@ export interface ComposeInput {
    * those use the SUB_NICHES name directly.
    */
   nicheLabel?: string | null;
+  /**
+   * The site's own brand/store name (blogs.brand_name — the operator-confirmed
+   * column, never content/brand.ts's deriveBrandName() suggestion). Substituted
+   * into the {brand} placeholder inside the schema spec — see
+   * libraries/schemas.ts. Null/empty renders an explicit "omit the brand
+   * element" sentinel rather than an empty string, so the model never emits a
+   * dangling " | ".
+   */
+  brandName?: string | null;
 }
 
 export interface ComposeResult {
@@ -312,6 +322,12 @@ export function composeForPost(input: ComposeInput): ComposeResult {
       ? input.nicheLabel.trim()
       : subNiche.name;
 
+  // Fills {brand} inside the schema spec. The sentinel (rather than "") keeps
+  // the instruction readable when a blog has no brand name, so the model drops
+  // the element instead of emitting a dangling " | ".
+  const brandLabel =
+    (input.brandName ?? "").trim() || "NONE — omit the brand element entirely";
+
   // S8 requires a pre-rolled question. If absent, synthesize a default form.
   const questionAboutTopic =
     input.questionAboutTopic ??
@@ -365,6 +381,11 @@ export function composeForPost(input: ComposeInput): ComposeResult {
       citationExampleForSubNiche(citation, profile.subNicheId),
     ],
     ["{schema.json}", schema.jsonSpec],
+    // MUST stay after {schema.json}: the schema spec is what CONTAINS {brand},
+    // and it only enters the body when the line above runs. The loop is
+    // single-pass over this array (twice over the body), so a {brand} entry
+    // placed earlier would never find anything to replace.
+    ["{brand}", brandLabel],
     ["{tag_set.allowed_tags}", `<${tagSet.allowedTags.join(">, <")}>`],
     ["{compliance.placement}", placement],
     ["{compliance.phrases_rendered}", phrasesRendered],

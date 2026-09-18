@@ -884,8 +884,16 @@ export async function runGenerateAndPublish(
       brandName: blog.brandName,
       internalLinkRefs,
       knowledgeSummaries: knowledge.summaries,
-      // Consumed by the article prompt in T05. Inert until then.
-      supportingQueries,
+      // The T11 -> T05 handshake. T11 selected primaryQuery from the client's
+      // demand-validated pool and had the model name the real sub-questions a
+      // searcher for it also needs answered; T05's SEARCH BRIEF is what puts
+      // both in front of the writer. Undefined when T11 fell back to ungrounded
+      // ideation, in which case renderSearchBrief derives a target query from
+      // keywords[0]/topic and explicitly tells the model not to invent a
+      // question list rather than manufacturing one.
+      searchIntent: primaryQuery
+        ? { targetQuery: primaryQuery, relatedQuestions: supportingQueries }
+        : undefined,
       localTarget: useLocalTarget ? localTarget : undefined,
       cta,
       // T02: the money link points at the client's real destination, not at

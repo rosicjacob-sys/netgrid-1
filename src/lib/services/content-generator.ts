@@ -24,6 +24,12 @@ import {
   normalizeQueryKey,
 } from "@/lib/content/topic-similarity";
 import {
+  renderSearchBrief,
+  renderReferenceFacts,
+  type SearchBriefInput,
+  type SearchIntentContext,
+} from "@/lib/content/search-brief";
+import {
   getIdeationCandidatesForBlog,
   type IdeationCandidateSet,
   type TopicCandidate,
@@ -592,15 +598,27 @@ export interface GenerateOptions {
     brandUrl?: string | null;
   };
   /**
-   * The 3-6 sub-questions topic ideation committed this article to answering,
-   * drawn from the same demand-validated query pool as the topic itself (see
-   * IdeatedTopic.supportingQueries). Empty on the ungrounded fallback path.
+   * Search-intent brief for this post: the query the page must win, its
+   * classified intent, and the REAL related questions it has to answer.
+   * Supplied by T11 from the demand-validated candidate pool. Absent => the
+   * brief degrades to a target query derived from localTarget.keyword /
+   * keywords[0] / topic, and the model is told explicitly NOT to invent a
+   * question list.
    *
-   * T11 produces, persists and threads these. T05 is the prompt change that
-   * turns them into required sub-headings; until T05 lands this field is
-   * carried but not read, which is intentional and inert.
+   * This REPLACES the `supportingQueries?: string[]` field T11 added as a
+   * placeholder. That field was never read by anything; carrying both it and
+   * searchIntent.relatedQuestions would be two fields meaning the same thing,
+   * which is how the two drift apart. T11's IdeatedTopic.supportingQueries is
+   * unchanged — it still feeds generated_posts.supporting_queries as the audit
+   * trail, and now also feeds relatedQuestions here.
    */
-  supportingQueries?: string[];
+  searchIntent?: SearchIntentContext;
+}
+
+/** One FAQ entry. Mirrors the FAQ section inside the article body. */
+export interface FaqItem {
+  question: string;
+  answer: string;
 }
 
 export interface GeneratedContent {
@@ -611,6 +629,12 @@ export interface GeneratedContent {
   metaDescription: string;
   keywords: string[];
   wordCount: number;
+  /**
+   * Q/A pairs mirroring the article's FAQ section, as plain text. Undefined
+   * when the model returned none. Consumed as FAQPage JSON-LD by T20 — which
+   * is why answers are stripped of HTML and questions are deduplicated.
+   */
+  faq?: FaqItem[];
 }
 
 export interface AnalysisScores {
@@ -1075,6 +1099,37 @@ function normalizeArticleShape(
   }
 
   return parsed;
+}
+
+/**
+ * Coerce the model's `faq` field into clean Q/A pairs.
+ *
+ * Returns undefined rather than [] when nothing usable came back, so callers
+ * can distinguish "the model wrote no FAQ" from "the FAQ was empty". Answers
+ * are forced to plain text: this array is consumed as FAQPage JSON-LD (T20),
+ * where HTML tags are invalid. Duplicate questions are dropped for the same
+ * reason — a repeated question produces invalid FAQPage markup. Capped at 8
+ * entries; beyond that it is padding, not answers.
+ */
+function normalizeFaq(raw: unknown): FaqItem[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const out: FaqItem[] = [];
+  const seen = new Set<string>();
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object") continue;
+    const e = entry as Record<string, unknown>;
+    const rawQuestion = typeof e.question === "string" ? e.question : "";
+    const rawAnswer = typeof e.answer === "string" ? e.answer : "";
+    const question = rawQuestion.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+    const answer = rawAnswer.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+    if (!question || !answer) continue;
+    const key = question.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ question, answer });
+    if (out.length >= 8) break;
+  }
+  return out.length > 0 ? out : undefined;
 }
 
 /**
@@ -2351,9 +2406,38 @@ export function resolveCodeNiche(niche: string | null | undefined): ResolvedNich
 }
 
 /**
+ * Escape a value for embedding inside a JSON *string literal* that we are
+ * printing into a prompt as the model's output contract.
+ *
+ * blogs.brand_name is operator-entered free text. A store called
+ * `Joe's "Best" Peptides` would otherwise close the surrounding JSON string
+ * early, so the model is shown a malformed object and asked to return one like
+ * it. Backslash first, then the quote — the other order double-escapes.
+ */
+function escapeForJsonString(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+/**
+ * Narrow GenerateOptions down to what the search brief needs. Keeps
+ * search-brief.ts free of a dependency on this module (and therefore on the
+ * Anthropic SDK), which is what makes it unit-testable without an API key.
+ */
+function briefInput(opts: GenerateOptions): SearchBriefInput {
+  return {
+    topic: opts.topic,
+    keywords: opts.keywords ?? [],
+    searchIntent: opts.searchIntent,
+    localKeyword: opts.localTarget?.keyword ?? null,
+  };
+}
+
+/**
  * Assemble the legacy article system prompt from a RESOLVED niche + per-blog
- * options. Extracted verbatim from buildSystemPrompt so the identical assembly
- * can render from either the code niche (live) or a DB niche (preview/parity).
+ * options. The prompt LEADS with the search brief: the query this page must
+ * win, its intent, and the real sub-questions it has to answer. Before T05 it
+ * opened with voice rules and spent 44% of its lines on a forbidden-word list
+ * while never naming the query at all.
  */
 export function renderSystemPrompt(
   opts: GenerateOptions,
@@ -2369,8 +2453,26 @@ export function renderSystemPrompt(
   // Per-blog stylistic tics — picked deterministically from QUIRK_POOL by
   // blogSeed. Same blog always writes with the same 2 quirks.
   const quirks = pickQuirks(opts.blogSeed, 2);
+  // The site's own name goes into the TITLE TAG (metaTitle), not the visible
+  // H1: the H1 is the reader's headline, the title tag is the SERP surface
+  // where the brand is an entity signal. appendBrandToTitle() (via
+  // normalizeMetaTitle) enforces this deterministically after generation and
+  // is pixel-budgeted; the rule here is so the model budgets the characters
+  // for it in the first place rather than filling them with keyword.
+  const brand = (opts.brandName ?? "").trim();
+  const brandMetaRule = brand
+    ? // Single quotes around the suffix, and the brand itself escaped: this
+      // string is interpolated INTO the JSON example in the OUTPUT FORMAT
+      // block below, so a raw double quote here — from the separator or from
+      // an operator-entered brand like `Joe's "Best" Peptides` — closes the
+      // surrounding JSON string value early and hands the model a malformed
+      // object as its output contract.
+      `Keep the headline part under ~40 characters, then end with ' | ${escapeForJsonString(brand)}'.`
+    : `This site has no configured brand name — omit any brand element.`;
 
-  let prompt = `You are an expert content writer in the ${niche.industry} space. Write a comprehensive, original article that reads like it was written by someone with deep first-hand experience.
+  let prompt = `${renderSearchBrief(briefInput(opts))}
+
+You are writing ONE page for a site in the ${niche.industry} space. The page exists to answer the TARGET QUERY above better than the pages currently ranking for it. Write it as someone with real working knowledge of the subject, for a reader who leaves immediately if the first paragraph does not answer their question.
 
 VOICE & STYLE:
 - Brand voice: ${brandVoice}
@@ -2379,46 +2481,18 @@ VOICE & STYLE:
 - Style: ${niche.contentStyle}
 
 QUALITY BAR:
-- Specific over generic — exact prices, real brand/tool names, concrete numbers
-- Show your reasoning, don't just assert
-- Include trade-offs and limitations honestly, not just upsides
+- Answer the question before you explain it. No scene-setting, no definitions the searcher already knows by having searched.
+- Show your reasoning; don't just assert.
+- Give trade-offs, limitations, and the cases where the obvious answer is wrong.
+- Concrete specifics — prices, dosages, dates, percentages, statistics, model numbers, study results — may ONLY come from reference material supplied to you. See FACTS POLICY below. Where you have no supplied figure, write the qualitative truth instead ("cheaper than a single consultation", "usually a few weeks"). Never a fabricated number.
 
-FORBIDDEN AI TELLS (will cause the post to be rejected):
-
-Punctuation:
-- NEVER use em-dashes (—) or en-dashes (–) as pause markers. Replace with periods, commas, or sentence breaks.
-- NEVER use the single-character ellipsis (…). Use three periods (...).
-- NEVER use curly/smart quotes (" " ' '). Use straight quotes (" and ').
-
-Forbidden vocabulary (do not appear in any context):
-delve, tapestry, realm, ecosystem (as metaphor), landscape (as metaphor), journey (as metaphor), navigate (as metaphor), unleash, harness, foster, cultivate, embark, robust, seamless, holistic, nuanced, paradigm, multifaceted, intricate, pivotal, plethora, myriad, gleaned, meticulous, underscore, bolster, garner.
-
-Forbidden phrases (never include any of these):
-- "It's not just X, it's Y"
-- "Whether you're X or Y..."
-- "In today's [world / fast-paced / digital / modern]..."
-- "Game-changer", "Revolutionary", "Transformative"
-- "It's worth noting that"
-- "That said," / "With that in mind"
-- "Look no further" / "Without further ado"
-- "When it comes to"
-- "Let's dive in" / "Let's explore"
-- "At its core"
-- Sentence-initial: "Ultimately," / "Fundamentally," / "Essentially,"
-- "The key takeaway"
-- Sign-off lines like "Happy [verbing]!"
-- Filler transitions: "Moreover," "Furthermore," "In conclusion"
-
-Forbidden structural patterns:
-- Do NOT make every paragraph exactly 3 or 4 sentences. Vary paragraph length deliberately: some single-sentence paragraphs for emphasis, some 5–7 sentence paragraphs, some short.
-- Do NOT use perfect parallel structure in every list. Real writers break parallelism naturally.
-- Do NOT open with a time-anchored cliché ("In today's...", "In an era of...").
-- Do NOT close with "In conclusion" or a recap paragraph.
-
-CADENCE TARGET:
-- Average sentence length: 15–20 words.
-- HIGH variance: include at least 3–5 sentences under 10 words AND at least 2–3 sentences over 25 words.
-- Paragraphs vary between 1 and 7 sentences.
+STRUCTURE:
+- First 120 words: answer the TARGET QUERY directly and completely enough to stand alone if lifted out of the page. This is the passage a search engine quotes.
+- Then one <h2> per question from the SEARCH BRIEF, in the order listed, worded close to how the question is actually asked.
+- <h3> only for genuine subdivisions inside a section.
+- Lists where they carry information, not where they pad.
+- End with an FAQ section: one <h2> for it, then one <h3> per remaining question with a 40-90 word answer under it.
+- Close on the practical consequence for the reader, not a recap.
 
 WORD COUNT (HARD LIMITS):
 - Minimum ${wb.min} words — anything shorter will be rejected.
@@ -2429,28 +2503,32 @@ WORD COUNT (HARD LIMITS):
 IMAGES:
 - Do NOT include any <img>, <figure>, <picture>, or <figcaption> tags in your output. A hero image is attached as the article's featured image at publish time — any inline images you emit will be stripped.
 
-STRUCTURE:
-- Open with a substantive hook (no time-anchored opener).
-- Use <h2> for major sections, <h3> for subsections.
-- Lists where useful, not where padding.
-- Close with concrete takeaways, not platitudes.
-
 OUTPUT FORMAT:
 Return ONLY valid JSON with EXACTLY these top-level keys:
 {
-  "title": "Article title, primary keyword first, ~50 characters, no site/brand name",
+  "title": "The reader's headline. Lead with the answer or the promise, not a keyword dump. ~60 characters. No brand name here.",
   "content": "Full HTML article between ${wb.min} and ${wb.max} words",
   "excerpt": "150-160 character summary",
-  "metaTitle": "SEO title tag, primary keyword FIRST, ~50 characters max (must render under 580px). Use ' | ' not '-' as a separator. No brand/site name, no duplicate words.",
-  "metaDescription": "Meta description, primary keyword early, ~140 characters max (must render under 1000px). One natural sentence ending with a soft call to action.",
-  "keywords": ["keyword1", "keyword2", "keyword3"]
+  "metaTitle": "Title tag. ${brandMetaRule} Use ' | ' as the separator, never ' - '. Must render under 580px.",
+  "metaDescription": "Meta description, ~140 characters max (must render under 1000px). One natural sentence saying what the page answers.",
+  "keywords": ["keyword1", "keyword2", "keyword3"],
+  "faq": [{ "question": "exact question wording", "answer": "40-90 word answer, plain text, no HTML" }]
 }
 
 JSON SHAPE — strict:
 - "content" is ONE HTML string. Do not split into "intro"/"items"/"sections"/"paragraphs"/"deck"/"body"+"conclusion". Build one HTML string.
+- "faq" holds 3-6 entries and MIRRORS the FAQ section inside "content" — same questions, same answers, plain text. It is machine-read for structured data; if the two disagree, the published page carries wrong markup.
+- FAQ question wording must be unique across the whole page. A heading whose text repeats an earlier heading is deleted automatically after generation, which would orphan its answer.
 - Do not wrap the response in another object ({"article": ...}). Return the JSON directly.
 - Use field names exactly as shown ("content" not "html"/"body"/"article_html"; "title" not "headline"/"post_title").
-- Allowed tags in "content": <h2>, <h3>, <p>, <ul>, <ol>, <li>, <strong>, <em>, <a>. No images, no markdown headings.`;
+- Allowed tags in "content": <h2>, <h3>, <p>, <ul>, <ol>, <li>, <strong>, <em>, <a>. No images, no markdown headings.
+
+STYLE APPENDIX — surface hygiene. This is not what the page is for; get it right anyway, because these patterns get a post rejected:
+- Punctuation: no em-dashes (—) or en-dashes (–) as pause markers; no single-character ellipsis (…), use three periods; no curly/smart quotes, use straight quotes.
+- Never use these words: delve, tapestry, realm, ecosystem/landscape/journey/navigate as metaphors, unleash, harness, foster, cultivate, embark, robust, seamless, holistic, nuanced, paradigm, multifaceted, intricate, pivotal, plethora, myriad, gleaned, meticulous, underscore, bolster, garner.
+- Never write these: "It's not just X, it's Y" / "Whether you're X or Y" / "In today's [world/fast-paced/digital/modern]" / "game-changer" / "revolutionary" / "transformative" / "it's worth noting" / "that said," / "with that in mind" / "look no further" / "without further ado" / "when it comes to" / "let's dive in" / "at its core" / sentence-initial "Ultimately," "Fundamentally," "Essentially," / "the key takeaway" / "Happy [verb]ing!" / "Moreover," / "Furthermore," / "In conclusion".
+- Vary paragraph length deliberately between 1 and 7 sentences. Do not make every paragraph 3-4 sentences, do not make every list perfectly parallel, do not open with a time-anchored cliché, do not close with a recap.
+- Cadence: average sentence 15-20 words, with at least 3-5 sentences under 10 words and at least 2-3 over 25.`;
 
   if (quirks.length > 0) {
     prompt += `\n\nTHIS BLOG'S WRITING HABITS (apply consistently across the article):\n${quirks.map((q) => `- ${q}`).join("\n")}`;
@@ -2463,11 +2541,11 @@ JSON SHAPE — strict:
 
   // SEO REQUIREMENTS block removed per the footprint audit (insight 2):
   // "Natural keyword density 1-2%" / "primary keyword in first 100 words"
-  // optimize to exactly what classifiers fingerprint. The structure rules
-  // above are enough; entity coverage + uniqueness is the right replacement
-  // (separate follow-up). Keeping seoOptimized for back-compat / future use.
+  // optimize to exactly what classifiers fingerprint. The SEARCH BRIEF above
+  // plus the ANSWER-FIRST / INFORMATION GAIN blocks in SEO_QUALITY_DIRECTIVE
+  // are the replacement. Keeping seoOptimized for back-compat / future use.
   if (opts.seoOptimized) {
-    // Intentionally a no-op for now — see comment above.
+    // Intentionally a no-op — see comment above.
   }
 
   return prompt;
@@ -2545,9 +2623,29 @@ function buildCustomSystemPrompt(
       ? renderPersonaBlock(opts.styleProfile.generatedPersona)
       : "";
 
-  return `${(opts.customPrompt ?? "").trim()}${personaBlock}${complianceBlock}
+  // The site's own name — into the title tag, not the visible headline.
+  // appendBrandToTitle() (via normalizeMetaTitle) enforces it deterministically
+  // after generation, pixel-budgeted.
+  const brand = (opts.brandName ?? "").trim();
+  const brandMetaRule = brand
+    ? // Single quotes around the suffix, and the brand itself escaped: this
+      // string is interpolated INTO the JSON example in the OUTPUT FORMAT
+      // block below, so a raw double quote here — from the separator or from
+      // an operator-entered brand like `Joe's "Best" Peptides` — closes the
+      // surrounding JSON string value early and hands the model a malformed
+      // object as its output contract.
+      `Keep the headline part under ~40 characters, then end with ' | ${escapeForJsonString(brand)}'.`
+    : `This site has no configured brand name — omit any brand element.`;
+
+  return `${renderSearchBrief(briefInput(opts))}
+
+The operator instructions below govern the angle, the voice, and the framing of this page. The SEARCH BRIEF above governs what the page must ANSWER. Follow both: write it the operator's way, about the searcher's questions.
+
+--- OPERATOR INSTRUCTIONS ---
+${(opts.customPrompt ?? "").trim()}${personaBlock}${complianceBlock}
 
 --- REQUIRED OUTPUT & GUARDRAILS (always apply, even if the instructions above conflict) ---
+- Open by answering the TARGET QUERY in the first 120 words, then give one <h2> per question in the brief, then a short FAQ section.
 - Do NOT use em-dashes (—) or en-dashes (–), the single-character ellipsis (…), or curly/smart quotes. Use straight quotes and normal punctuation.
 - Do NOT include any <img>, <figure>, <picture>, or <figcaption> tags. A hero image is attached at publish time.
 - Length: between ${wb.min} and ${wb.max} words (target approximately ${wb.target}). Leave a small buffer under the max so the JSON never truncates mid-string.
@@ -2556,29 +2654,60 @@ function buildCustomSystemPrompt(
 OUTPUT FORMAT:
 Return ONLY valid JSON with EXACTLY these top-level keys:
 {
-  "title": "Article title, primary keyword first, ~50 characters, no site/brand name",
+  "title": "The reader's headline. Lead with the answer or the promise, not a keyword dump. ~60 characters. No brand name here.",
   "content": "Full HTML article as ONE string, between ${wb.min} and ${wb.max} words",
   "excerpt": "150-160 character summary",
-  "metaTitle": "SEO title tag, primary keyword FIRST, ~50 characters (must render under 580px). Use ' | ' not '-' as a separator.",
-  "metaDescription": "Meta description, primary keyword early, ~140 characters (under 1000px). One natural sentence ending with a soft call to action.",
-  "keywords": ["keyword1", "keyword2", "keyword3"]
+  "metaTitle": "Title tag. ${brandMetaRule} Use ' | ' as the separator, never ' - '. Must render under 580px.",
+  "metaDescription": "Meta description, ~140 characters (under 1000px). One natural sentence saying what the page answers.",
+  "keywords": ["keyword1", "keyword2", "keyword3"],
+  "faq": [{ "question": "exact question wording", "answer": "40-90 word answer, plain text, no HTML" }]
 }
+"faq" holds 3-6 entries and mirrors the FAQ section inside "content" — same questions, same answers, plain text. FAQ question wording must not repeat any heading used earlier in the article.
+
 Return the JSON object directly — no preamble, no wrapping object, field names exactly as shown.`;
 }
 
 /**
- * On-page quality rules appended to every article-generation system prompt
- * (both the profile and legacy paths). Phrased as natural-language ceilings,
- * not mechanical SEO knobs (no keyword-density / "keyword in first 100 words"
- * rules — those are AI-detector fingerprints, deliberately avoided).
+ * The rules that apply to EVERY article regardless of which builder produced
+ * the system prompt — appended on all three paths (custom, profile, legacy) in
+ * generateContent. Four blocks:
+ *
+ *   ANSWER-FIRST     — the snippet-eligible opening and the h2-per-question shape
+ *   INFORMATION GAIN — the page must contain something the query does not
+ *   FACTS POLICY     — the replacement for the old "exact prices" mandate, which
+ *                      instructed a model with no retrieval to invent specifics
+ *   ON-PAGE QUALITY  — the original four hygiene bullets, kept verbatim; they
+ *                      are tied to live Seobility audit checks
+ *
+ * Still phrased as natural-language ceilings, not mechanical SEO knobs (no
+ * keyword-density / "keyword in first 100 words" rules — those are AI-detector
+ * fingerprints, deliberately avoided).
  */
 const SEO_QUALITY_DIRECTIVE = `
+ANSWER-FIRST STRUCTURE (where this conflicts with any structural flow given above, this wins):
+- The first 120 words must answer the TARGET QUERY directly and completely enough to stand alone if lifted out of the page. No preamble, no history, no "in this article we will".
+- One <h2> per question the page answers, worded close to the question itself. A reader who scans only the headings must be able to find their question.
+- Every section pays off its heading within its first two sentences.
+- Finish with an FAQ section: an <h2> for it, then one <h3> question with a 40-90 word answer for each question that did not earn a full section, and mirror those pairs into the "faq" field of your JSON.
+- Heading text must be unique across the whole page, FAQ questions included. A heading that repeats an earlier one is deleted automatically, which orphans its answer.
+
+INFORMATION GAIN (the page has to be worth ranking):
+- At least two things in this article must be things a competent generalist could NOT have written from the query alone: a mechanism actually explained, a real trade-off with the conditions under which each side wins, a common mistake and why people make it, an edge case, or a decision rule the reader can apply.
+- Do not restate the query back to the reader in different words, and do not spend paragraphs defining terms the searcher already knows by having searched for them.
+- If a section would only hold generic advice, cut it and go deeper on the sections that carry real content. A shorter page that answers is better than a longer page that circles.
+
+FACTS POLICY (strict — this replaces any instruction anywhere above to be "specific" by inventing detail):
+- REFERENCE MATERIAL means: the CLIENT KNOWLEDGE BASE block, the REFERENCE FACTS block, the EXTERNAL NEWS REFERENCES list, and the INTERNAL LINKS list — wherever they appear, in this prompt or in the user message.
+- Prices, dosages, dates, percentages, statistics, study results, version numbers, named studies and quoted claims may ONLY be stated when the REFERENCE MATERIAL supplies them. Reproduce them as supplied; do not round, extrapolate or update them.
+- With no supplied figure, write the qualitative truth instead: "costs less than a single in-person consultation", "usually takes a few weeks", "most of the published work is in animal models". Vague and true beats precise and invented.
+- Never invent: a named source, a study, a statistic, a price, a customer, a physical location, a phone number, an award, or a date.
+- Never claim first-hand testing, personal use, or "we tried it" unless the REFERENCE MATERIAL says so.
 
 ON-PAGE QUALITY (apply throughout the article):
 - Keep the AVERAGE sentence length at or below ~20 words (shorter is fine; vary length for rhythm). Break up any single sentence that runs past ~28 words into two.
 - Every <h2>/<h3> heading must have UNIQUE text — never repeat the same heading wording, and do not restate the article title as a heading.
 - Every hyperlink must use UNIQUE, descriptive anchor text — never reuse the same anchor wording for two links, and don't use an anchor that merely repeats a heading.
-- Make the opening paragraph clearly on-topic: reference the article's main subject naturally in the first few sentences.`;
+- Make the opening paragraph clearly on-topic: reference the article's main subject naturally in the first few sentences.`
 
 /**
  * Local keyword-targeted content directive — appended alongside
@@ -3536,6 +3665,11 @@ export async function generateContent(opts: GenerateOptions): Promise<Generation
     ? buildLocalTargetingDirective(opts.localTarget)
     : "";
 
+  // Operator-supplied verified facts (searchIntent.referenceFacts). "" when
+  // none were supplied, so a post without them gets the prompt it would have
+  // got before this field existed.
+  const referenceFacts = renderReferenceFacts(briefInput(opts));
+
   let system: string;
   let user: string;
   // Word budget this call is being asked to fill. Drives the output-token
@@ -3553,6 +3687,7 @@ export async function generateContent(opts: GenerateOptions): Promise<Generation
       buildCustomSystemPrompt(opts, nicheForCustom) +
       languageDirective +
       knowledgeContext +
+      referenceFacts +
       SEO_QUALITY_DIRECTIVE +
       localTargetingDirective;
     user = buildUserPrompt(opts);
@@ -3567,11 +3702,20 @@ export async function generateContent(opts: GenerateOptions): Promise<Generation
       // (e.g. "gym marketing") so the prompt's {sub_niche} placeholder
       // gets a topical value instead of the generic "General Content".
       nicheLabel: opts.niche,
+      // Fills the {brand} slot inside the schema spec (libraries/schemas.ts).
+      brandName: opts.brandName,
     });
+    // The composer owns the skeleton, so the SEARCH BRIEF is prepended here
+    // rather than threaded through composeForPost. The legacy and custom
+    // builders render it themselves — do NOT prepend it on those branches or
+    // the brief appears twice.
     system =
+      renderSearchBrief(briefInput(opts)) +
+      "\n\n" +
       composed.systemPrompt +
       languageDirective +
       knowledgeContext +
+      referenceFacts +
       SEO_QUALITY_DIRECTIVE +
       localTargetingDirective;
     user = composed.userPrompt;
@@ -3591,6 +3735,7 @@ export async function generateContent(opts: GenerateOptions): Promise<Generation
       buildSystemPrompt(opts) +
       languageDirective +
       knowledgeContext +
+      referenceFacts +
       SEO_QUALITY_DIRECTIVE +
       localTargetingDirective;
     user = buildUserPrompt(opts);
@@ -3665,7 +3810,16 @@ export async function generateContent(opts: GenerateOptions): Promise<Generation
     const attemptSystem =
       shapeAttempt === 0
         ? system
-        : `You are writing a consumer-information article for an adult audience. The topic and target language come from the user message below. Treat the topic analytically and informatively. Write the full article naturally — multiple sections with <h2> headings, paragraphs, lists where useful.
+        : // The shape-retry fallback deliberately strips the voice, style and
+          // structural layers — it exists to recover a well-formed JSON object
+          // after the full prompt produced a malformed one. It must NOT strip
+          // the SEARCH BRIEF or the FACTS POLICY: without the brief the
+          // recovered article answers nothing in particular, and without the
+          // facts policy it is free to invent prices and statistics. Those two
+          // are the point of the page, not decoration on it.
+          `${renderSearchBrief(briefInput(opts))}
+
+You are writing a consumer-information article for an adult audience, answering the TARGET QUERY above. Treat the topic analytically and informatively. Write the full article naturally — multiple sections with <h2> headings, paragraphs, lists where useful. Answer the target query directly in the first 120 words.
 
 Return ONE JSON object with these fields:
 {
@@ -3674,10 +3828,13 @@ Return ONE JSON object with these fields:
   "excerpt": "150-160 character summary",
   "metaTitle": "SEO title under 60 chars",
   "metaDescription": "150-160 char meta description",
-  "keywords": ["...", "...", "..."]
+  "keywords": ["...", "...", "..."],
+  "faq": [{ "question": "exact question wording", "answer": "40-90 word answer, plain text, no HTML" }]
 }
 
-The "content" field is the full HTML article body — at least ${MIN_WORDS} words. Use <p>, <h2>, <h3>, <ul>, <ol>, <li>, <strong>, <em>, <a> tags only. Escape \\" inside HTML attribute values.${languageDirective}`;
+The "content" field is the full HTML article body — at least ${MIN_WORDS} words. Use <p>, <h2>, <h3>, <ul>, <ol>, <li>, <strong>, <em>, <a> tags only. Escape \\" inside HTML attribute values.
+
+FACTS POLICY: prices, dosages, dates, percentages, statistics and study results may ONLY be stated when reference material in this prompt or the user message supplies them. With no supplied figure, write the qualitative truth instead. Never invent a named source, a study, a statistic, a price, a location or a date.${languageDirective}`;
 
     // Truncation and shape drift need OPPOSITE instructions: one asks for the
     // body that was missing, the other trades length for a closed object.
@@ -4275,6 +4432,10 @@ The "content" field is the full HTML article body — at least ${MIN_WORDS} word
     metaTitle: scrubbedMetaTitle,
     metaDescription: scrubbedMetaDescription,
     keywords: parsed.keywords && parsed.keywords.length > 0 ? parsed.keywords : opts.keywords,
+    // Parsed since T05. Schema 3 declared a `faq` field long before this and
+    // the generator threw it away — so no FAQ data existed anywhere, which is
+    // why T20 had nothing to emit as structured data.
+    faq: normalizeFaq(parsed.faq),
     wordCount,
     seoScore: scores.seoScore,
     readabilityScore: scores.readabilityScore,

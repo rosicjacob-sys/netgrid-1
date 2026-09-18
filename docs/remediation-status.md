@@ -7,8 +7,11 @@ Where we left off, for whoever picks this up next.
 before assigning anything. This file only tracks *what has been done against
 them* — it does not restate the tasks.
 
-**Branch:** `claude/dazzling-maxwell-7qwt7b` · **PR:**
-[#137](https://github.com/rosicjacob-sys/netgrid-1/pull/137)
+**Branch:** `claude/dazzling-maxwell-7qwt7b` · **PR #137 is MERGED**
+([#137](https://github.com/rosicjacob-sys/netgrid-1/pull/137), merged
+2026-09-18, commit `5c9c9f3`) — it carried T03, T04, T07, T08, T10, T11, T13,
+T14, T15, T16, T17, T18. A merged PR cannot track new work: later tasks are
+stacked on top of merged `main` on the same branch and belong to a **new** PR.
 
 **Last updated:** 2026-09-18
 
@@ -60,7 +63,7 @@ the operator actions below are still required.
 
 ---
 
-## Status: 16 of 26 done, 10 remaining — **Phase 3 in progress**
+## Status: 17 of 26 done, 9 remaining — **Phase 3 in progress**
 
 ### Done before this session
 
@@ -84,19 +87,22 @@ the operator actions below are still required.
 | **T14** | Yoast meta no-op | Every Yoast WordPress post published with the theme's default title and no meta description, while the log said "(SEO meta set)". Three independent reasons, all returning HTTP 200. Fixed: new `docs/wordpress/netgrid-seo-bridge.php` MU-plugin registers the real `_yoast_wpseo_*` keys for REST with an `auth_callback` and refreshes Yoast's indexable cache; `updateYoastMeta` writes those keys and throws when the bridge is absent; every write is now confirmed against the live `<head>` before anything is called a success. `metaStatus: "written"` now requires live verification. Per-post result persisted on `generated_posts`, bridge version per blog, and a measure-then-repair backfill. Migration `0047`. |
 | **T10** | Keyword pipeline at scale + ledger draining | The weekly refresh scraped every client in one unordered sequential pass (~5 h at 1,500 clients), so it never returned and the ledger rebuild after it never ran at all. Now 4-way sharded, hourly, staggered, with a staleness cursor on `clients.keywords_refresh_attempted_at` stamped *before* the scrape. `markKeywordTargetFailed` no longer buries a row in `failed` on the first transient error — bounded retries with a cool-off, dead-lettering only once the budget is spent, plus a two-window reaper that respects in-flight posts. Scrape locales now come from the client's own blogs instead of guessing from `language_mode`. A blocked scrape is reported instead of looking like "no results". The DataForSEO provenance downgrade is fixed. Migration `0046`, which also releases the existing permanent graves. |
 | **T18** | Post-verification at scale | The sweep was a single unordered sequential loop over every active blog under `curl --max-time 660 --retry 3` — it never finished, and curl retried it three more times while the abandoned handler kept running. Now 4-way sharded (same hash partition as auto-publish, pinned by golden-value tests), concurrency-capped, wall-clock budgeted, ordered least-recently-verified-first so nothing starves, with batched writes, a persisted run summary in `activity_log`, coverage/silence alerts, and a retention prune. `posts_in_period` is a real 7-day count for the first time. The sweep no longer stamps `blogs.lastPostVerifiedAt` — that column is the auto-publish priority key. `vercel.json` deleted (two of its five schedules 404'd, two exactly duplicated Render). Migration `0045`. |
+| **T05** | Article prompt rewrite | The prompt spent 44% of its instruction budget (36 of 81 lines) on a forbidden-word list and **zero** of it on the query the page had to win. The complete "what should this article contain" guidance was three bullets, and the first of them — "exact prices, real brand/tool names, concrete numbers" — instructed a model with **no retrieval of any kind** to produce specifics it could only invent. Every fabricated price, dosage and statistic in the network traces to that one line. Now: every prompt path opens with a SEARCH BRIEF (target query, classified intent, the searcher's goal, and the real sub-questions from T11), the fabrication mandate is replaced by a strict FACTS POLICY, and ANSWER-FIRST / INFORMATION GAIN blocks require a snippet-eligible opening and something a generalist could not have written from the query alone. The `faq` field schema 3 had declared since forever — and the generator had always thrown away — is now parsed, which is what unblocks T20. All 8 schemas drop the identical keyword-first `metaTitle` grammar and put the site's own brand back into the title tag. No migration, no DB writes; fully revertable by `git`. |
 | **T11** | Ideation grounding | Topic ideation asked a model to invent both the subject and the target keywords from a niche label, then — when its own duplicate check failed three times — **published the duplicate anyway** with a `console.warn`. The database already held real query data (`client_keywords`, with volume and difficulty from the DataForSEO pull); ideation reached none of it in a usable shape. The dedup window was 24 titles, so a blog posting daily forgot what it wrote 13 days ago and the collision rate rose with the blog's age. And the tokenizer split on `[^a-z0-9]`, treating every accented letter as a delimiter — two identical French sentences scored **0.08**, so every French blog had no duplicate detection at all. Now: `ideateTopic` selects an **angle** over a supplied, demand-ranked, already-filtered candidate list; a permanent `blog_covered_queries` table replaces the 24-title window; the accept-the-duplicate branch is gone (exhaustion refuses to publish instead); the ledger path is no longer exempt from duplicate detection; and `temperature` drops 0.9 → 0.35 for what should be the least creative decision in the pipeline. Migration `0050`. |
 | **T13** | Composer repair | Every non-peptide blog in the network was writing from **one** template. `buildStructuralPool` filtered on `subNicheFit` at all three tiers, and no template declares a sub-niche above 13 — so the pool came back `[]` for sub-niches 14-90 and `pickTemplateForPost` silently served `TEMPLATES[1]`, peptide section labels ("Mechanism — how the compound works at cellular level") included, on every roofing, loans and casino post ever published. Separately `archetypeForVoice` scanned only the `voiceRange` bands, which stop at V77, so all 50 cross-niche voices collapsed onto archetype 1 and 5 of 12 skeletons were unreachable. Now: 22 niche-neutral flow variants (`CROSS_NICHE_FLOWS`), a 6-tier pool ladder with a sub-niche-agnostic floor, `archetypeForVoice` reading the voice's declared archetype, and the three dead compatibility guards (`SubNiche`, `Cadence`, `Strictness`) finally called. Two strings that were being ordered into published HTML are gone: the literal `(no compliance phrase required for this niche)` and the raw token `{citation.style}`. No migration — data repair only, via `src/lib/db/repair-structural-pools.ts`. |
 | **T17** | Cadence integrity | One canonical `blogs.posting_plan integer[7]` replaces four disagreeing columns. New pure module `src/lib/posting-plan.ts`; publisher, verifier, pipeline-alerts, validators, CSV importer, form, admin + portal UIs all read it. Publish window narrowed to 0–17h so no blog has a single tick of runway. `?dry=1` on the auto-publish route. "No posting plan" is now a critical notification and an `activity_log` row, not a discarded JSON string. Migration `0043`; `0044_drop_legacy_cadence.sql.pending` written but inert. |
 
-### Remaining: 10
+### Remaining: 9
 
 Grouped by the phase plan; ordering follows T00's dependency map.
 
-**Phase 3 — content & targeting (5 of 7 left)**
+**Phase 3 — content & targeting (4 of 7 left)**
 
-`T13` composer repair and `T11` ideation grounding are **done**. Next: `T05`
-prompt rewrite → `T21` prompt contradictions; plus `T12` author entities →
-`T20` FAQ structured data. `T09` winnability sits outside that order (below).
+`T13` composer repair, `T11` ideation grounding and `T05` prompt rewrite are
+**done**. Next: `T21` prompt contradictions; plus `T12` author entities →
+`T20` FAQ structured data. **`T20` is now unblocked** — T05 parses the `faq`
+field, so question/answer pairs exist as data for the first time. `T09`
+winnability sits outside that order (below).
 
 T11 was taken ahead of T09 deliberately, and the SOP sanctions it: T11 defines
 the ranking seam (`rankedQueriesForClient` in
@@ -294,6 +300,40 @@ If you apply an SOP verbatim, **check the highest existing file first.**
 
 Flagged deliberately rather than quietly left.
 
+- **T05's Step 11 was already built — by T01.** The SOP specifies a new
+  `src/lib/seo/brand-title.ts` that pixel-budgets a brand suffix around
+  `appendRedditToTitle` in `reddit.ts`. That file no longer exists: T01 deleted
+  it and shipped `src/lib/seo/meta-suffix.ts`, whose `appendBrandToTitle` is
+  the same injector, already pixel-budgeted, already idempotent, already
+  brand-yields-first, and already wired through `normalizeMetaTitle`. Building
+  the SOP's version would have put two modules on one write surface — the
+  failure mode the `netgrid-gsc`/`netgrid-seo` marker note below describes.
+  T01's rule also **overrides T05's** on where the brand comes from: T05 says
+  "`blogs.brand_name`, or `deriveBrandName()` from the domain"; T01 says the
+  title tag takes the operator-confirmed column **only**, never the derived
+  suggestion. The callers already do it T01's way and were left alone.
+- **T05's brand rule shipped malformed JSON in the SOP as written.** The
+  specified text is ``then end with " | ${brand}"`` — interpolated *into* the
+  JSON example that the OUTPUT FORMAT block presents as the model's output
+  contract. The double quotes close the surrounding JSON string value early, so
+  the model was to be shown a malformed object and asked to return one like it.
+  Fixed with single quotes **and** `escapeForJsonString(brand)`, because
+  `blogs.brand_name` is operator-entered free text: a store called
+  `Joe's "Best" Peptides` breaks it again otherwise. `article-prompt.test.ts`
+  parses the rendered contract with `JSON.parse` on all three cases.
+- **T05 replaced T11's `GenerateOptions.supportingQueries` rather than adding
+  beside it.** T11 added that field as a placeholder and nothing ever read it.
+  Carrying both it and `searchIntent.relatedQuestions` would be two fields
+  meaning the same thing, which is how the two drift apart.
+  `IdeatedTopic.supportingQueries` is untouched — it still feeds
+  `generated_posts.supporting_queries` as the audit trail, and now also feeds
+  `relatedQuestions`.
+- **T05's shape-retry fallback keeps the brief and the facts policy.** The
+  retry prompt deliberately strips voice, style and structure to recover a
+  well-formed JSON object. Left as the SOP had it, it also stripped the SEARCH
+  BRIEF and the FACTS POLICY — so a recovered article answered nothing in
+  particular and was free to invent figures. Those two are the point of the
+  page, not decoration on it.
 - **T11 deliberately makes some blogs stop publishing.** A blog that has
   covered every demand-validated query in its client's pool now returns
   `exhausted: true` and publishes **nothing**, where the old code published a
