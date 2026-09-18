@@ -42,6 +42,48 @@ services:
       # there, not in the cron container, and the two have separate env sets.
       - key: ALERT_EMAIL_TO
         sync: false
+      # ── Keyword pipeline (T10) ────────────────────────────────────────
+      # All optional; the values shown are the in-code defaults unless noted.
+      # Sized for a ~1,500-client / ~1,500-active-city-blog network — re-derive
+      # them if that changes materially.
+      #
+      # Clients one shard scrapes per hourly run. The time budget below
+      # normally binds first (~12 clients at 210 s); this is the safety net.
+      - key: KEYWORD_REFRESH_MAX_CLIENTS
+        value: "15"
+      # Wall-clock budget for the scrape phase, ms. Leave headroom for the
+      # rebuild phase inside CRON_MAX_TIME (660 s).
+      - key: KEYWORD_REFRESH_TIME_BUDGET_MS
+        value: "210000"
+      # A client is only a candidate once its last ATTEMPT is this old. This is
+      # the real cadence control — the cron schedule just supplies slots.
+      - key: KEYWORD_REFRESH_MIN_AGE_HOURS
+        value: "144"
+      # HTTP requests per scrapeKeywords() call, per locale. 12 seeds x 27
+      # queries = 324 uncapped; 160 halves both wall clock and block risk.
+      - key: KEYWORD_SCRAPE_MAX_QUERIES
+        value: "160"
+      # Parallel suggest requests inside ONE scrape. 3, not the code default of
+      # 6: this is the peak request rate against Google from the single Render
+      # egress IP. If activity_log starts showing keywords.scrape_blocked,
+      # halve this FIRST, then halve KEYWORD_REFRESH_MAX_CLIENTS.
+      - key: KEYWORD_SCRAPE_CONCURRENCY
+        value: "3"
+      # Ledger rebuild bounds, per run.
+      - key: KEYWORD_REBUILD_MAX_BLOGS
+        value: "400"
+      - key: KEYWORD_REBUILD_TIME_BUDGET_MS
+        value: "120000"
+      # Ledger retry lifecycle. attempts >= MAX dead-letters the row to
+      # 'failed'; RETRY_DELAY_HOURS is the cool-off before a requeued row is
+      # claimable; STUCK_MINUTES is the reaper window for rows stranded in
+      # 'generating' with no post attached.
+      - key: KEYWORD_TARGET_MAX_ATTEMPTS
+        value: "3"
+      - key: KEYWORD_TARGET_RETRY_DELAY_HOURS
+        value: "6"
+      - key: KEYWORD_TARGET_STUCK_MINUTES
+        value: "90"
       - key: ALERT_SUPPRESS_HOURS
         value: "6"
       # Article-generation output-token budget (T06). Both optional — the code
@@ -462,22 +504,100 @@ services:
       - key: CRON_SECRET
         sync: false
 
-  # Re-scrape per-client keyword sets (Google Autocomplete) so the keywords
-  # bound to content generation stay fresh. Weekly, 03:00 UTC Monday — off-peak
-  # and staggered from the news refresh.
+  # ──────────────────────────────────────────────────────────────────────
+  # Keyword refresh — 4-way SHARDED, hourly, STAGGERED.
+  #
+  # Each client's UUID is hashed and assigned to one shard (shardForBlog in
+  # src/lib/cron/sharding.ts — same SHA1 bytes 8-15 the auto-publish crons
+  # have always used), so the four services are disjoint.
+  #
+  # Unlike auto-publish, the four run at DIFFERENT minutes (:07/:22/:37/:52).
+  # They all scrape the same Google endpoint from the same Render egress IP,
+  # so firing them together would multiply the peak request rate by four —
+  # the fastest way to get the source blocked. Staggered, only one shard is
+  # ever scraping.
+  #
+  # Cadence is enforced in SQL, not by the cron schedule: a client is a
+  # candidate only once clients.keywords_refresh_attempted_at is older than
+  # KEYWORD_REFRESH_MIN_AGE_HOURS (default 144 h = 6 days). Running hourly
+  # therefore does NOT scrape anyone 24x a day — it supplies slots.
+  #
+  #   ~17 s per client (160 requests x ~1.3 locales at concurrency 3)
+  #   -> ~12 clients per 210 s run
+  #   4 shards x 24 runs/day x 12  = ~1,150 client-slots/day
+  #   1,500 clients on a 6-day gate = ~250 needed/day
+  #   -> ~4.6x headroom; a cold start covers the whole network in ~1.5 days.
+  #
+  # Each run is bounded by KEYWORD_REFRESH_TIME_BUDGET_MS (210 s) plus the
+  # ledger rebuild (KEYWORD_REBUILD_TIME_BUDGET_MS, 120 s), so it returns well
+  # inside CRON_MAX_TIME. That matters: cron/invoke.sh runs curl with retries,
+  # and curl treats a timeout as a transient error — the old 5-hour run was
+  # being re-fired up to four times per schedule, each retry starting a fresh
+  # full-network scrape alongside the ones still running.
+  # ──────────────────────────────────────────────────────────────────────
   - type: cron
-    name: netgrid-cron-refresh-keywords
+    name: netgrid-cron-refresh-keywords-0
     runtime: docker
-    schedule: "0 3 * * 1"
+    schedule: "7 * * * *"
     dockerfilePath: ./cron/Dockerfile
     dockerContext: ./cron
     envVars:
       - key: CRON_PATH
-        value: /api/cron/refresh-keywords
+        value: /api/cron/refresh-keywords?shard=0&shardCount=4
       - key: APP_URL
         value: https://netgrid-16f6.onrender.com
       - key: CRON_SECRET
         sync: false
+      - key: CRON_MAX_TIME
+        value: "660"
+
+  - type: cron
+    name: netgrid-cron-refresh-keywords-1
+    runtime: docker
+    schedule: "22 * * * *"
+    dockerfilePath: ./cron/Dockerfile
+    dockerContext: ./cron
+    envVars:
+      - key: CRON_PATH
+        value: /api/cron/refresh-keywords?shard=1&shardCount=4
+      - key: APP_URL
+        value: https://netgrid-16f6.onrender.com
+      - key: CRON_SECRET
+        sync: false
+      - key: CRON_MAX_TIME
+        value: "660"
+
+  - type: cron
+    name: netgrid-cron-refresh-keywords-2
+    runtime: docker
+    schedule: "37 * * * *"
+    dockerfilePath: ./cron/Dockerfile
+    dockerContext: ./cron
+    envVars:
+      - key: CRON_PATH
+        value: /api/cron/refresh-keywords?shard=2&shardCount=4
+      - key: APP_URL
+        value: https://netgrid-16f6.onrender.com
+      - key: CRON_SECRET
+        sync: false
+      - key: CRON_MAX_TIME
+        value: "660"
+
+  - type: cron
+    name: netgrid-cron-refresh-keywords-3
+    runtime: docker
+    schedule: "52 * * * *"
+    dockerfilePath: ./cron/Dockerfile
+    dockerContext: ./cron
+    envVars:
+      - key: CRON_PATH
+        value: /api/cron/refresh-keywords?shard=3&shardCount=4
+      - key: APP_URL
+        value: https://netgrid-16f6.onrender.com
+      - key: CRON_SECRET
+        sync: false
+      - key: CRON_MAX_TIME
+        value: "660"
 
   # ──────────────────────────────────────────────────────────────────────
   # T03 — LINK-EXCHANGE REMOVAL. TEMPORARY SERVICE.

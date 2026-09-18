@@ -1486,7 +1486,7 @@ export async function reapStuckPublishes(
     .returning({ id: generatedPosts.id });
 
   // The keyword ledger's own orphans. See T10 for the broader ledger work.
-  const keywordTargets = await releaseStuckKeywordTargets(thresholdMinutes);
+  const keywordTargets = await releaseStuckKeywordTargets();
 
   if (
     reapedGenerating.length > 0 ||

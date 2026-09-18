@@ -191,19 +191,30 @@ async function main() {
     if (claimA) {
       await markKeywordTargetFailed(claimA.id, "smoke test — intentional failure");
       const [rowA] = await db
-        .select({ status: blogKeywordTargets.status, failureReason: blogKeywordTargets.failureReason })
+        .select({
+          status: blogKeywordTargets.status,
+          failureReason: blogKeywordTargets.failureReason,
+          attempts: blogKeywordTargets.attempts,
+          nextRetryAt: blogKeywordTargets.nextRetryAt,
+        })
         .from(blogKeywordTargets)
         .where(eq(blogKeywordTargets.id, claimA.id));
+      // T10: a single failure no longer buries the row in 'failed' forever.
+      // It is requeued to 'pending' with a cool-off, and only dead-letters to
+      // 'failed' once it has burned KEYWORD_TARGET_MAX_ATTEMPTS attempts.
       record(
-        "markKeywordTargetFailed sets status + reason",
-        rowA?.status === "failed" && Boolean(rowA?.failureReason),
-        `status=${rowA?.status} reason="${rowA?.failureReason}"`,
+        "markKeywordTargetFailed requeues to 'pending' with a cool-off",
+        rowA?.status === "pending" &&
+          rowA?.attempts === 1 &&
+          rowA?.nextRetryAt instanceof Date &&
+          Boolean(rowA?.failureReason),
+        `status=${rowA?.status} attempts=${rowA?.attempts} nextRetryAt=${rowA?.nextRetryAt?.toISOString() ?? "null"}`,
       );
     }
 
     const claimC = await claimKeywordTargetForBlog(blog.id);
     record(
-      "third claim returns the last remaining pending row",
+      "third claim skips the requeued row (cool-off not elapsed) and takes the next one",
       Boolean(claimC) && claimC?.id !== claimA?.id && claimC?.id !== claimB?.id,
       claimC ? `claimed "${claimC.keyword}"` : "claim returned undefined",
     );
@@ -223,7 +234,7 @@ async function main() {
 
     const claimD = await claimKeywordTargetForBlog(blog.id);
     record(
-      "ledger drained — fourth claim returns nothing (A=failed, B=generated, C=generating)",
+      "ledger drained — fourth claim returns nothing (A=requeued but cooling off, B=generated, C=generating)",
       claimD === undefined,
       claimD ? `unexpectedly claimed "${claimD.keyword}"` : "undefined, as expected",
     );

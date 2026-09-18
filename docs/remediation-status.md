@@ -43,6 +43,7 @@ absent), so PR #137 does not run them either.
 | The T17 `posting-plan` helpers executed against their 17 test cases | All pass, under a hand-written vitest shim (`describe`/`it`/`expect`), not vitest itself. |
 | The T17 CSV cadence parser executed against its 11 test cases | All pass, same shim. |
 | The T18 cadence + sharding helpers executed against their 23 test cases | All pass, same shim. Includes golden shard values proving the extraction out of `content-generation-actions.ts` moved no blog between shards. |
+| The T10 ccTLD mapping executed against its 4 test cases | All pass, same shim. |
 
 That process **did** catch three real defects that would have failed the build
 or corrupted data — see [Bugs found while implementing](#bugs-found-while-implementing).
@@ -63,7 +64,7 @@ T03 §8, T04 §8 and T08 §8. **Do not deploy on the strength of this document.*
 
 ---
 
-## Status: 10 of 26 done, 16 remaining
+## Status: 11 of 26 done, 15 remaining
 
 ### Done before this session
 
@@ -82,6 +83,7 @@ T03 §8, T04 §8 and T08 §8. **Do not deploy on the strength of this document.*
 | **T08** | Publish idempotency | `publish_day` + `day_slot` with a partial unique index; `cron/invoke.sh` retry/timeout fix; strict shard validation (400, not silent default); `reapStuckPublishes()`; `transient` on the result type so the worker-pool retry is reachable. Migration `0040`. |
 | **T03** | Link exchange shutdown | Engine hard-retired behind `LINK_EXCHANGE_RETIRED`; route returns 410 and imports nothing from the service; admin toggle refuses to re-enable; new `link-exchange-removal.ts` stripper + queue + cron. Migration `0041`. |
 | **T04** | Search Console feedback loop | `gsc-client.ts`, `gsc-verifier.ts`, `gsc-sync.ts`, `gsc-index-coverage.ts`, two cron routes, `search_performance` + `index_coverage` tables, 7 Render cron services. Migration `0042`. |
+| **T10** | Keyword pipeline at scale + ledger draining | The weekly refresh scraped every client in one unordered sequential pass (~5 h at 1,500 clients), so it never returned and the ledger rebuild after it never ran at all. Now 4-way sharded, hourly, staggered, with a staleness cursor on `clients.keywords_refresh_attempted_at` stamped *before* the scrape. `markKeywordTargetFailed` no longer buries a row in `failed` on the first transient error — bounded retries with a cool-off, dead-lettering only once the budget is spent, plus a two-window reaper that respects in-flight posts. Scrape locales now come from the client's own blogs instead of guessing from `language_mode`. A blocked scrape is reported instead of looking like "no results". The DataForSEO provenance downgrade is fixed. Migration `0046`, which also releases the existing permanent graves. |
 | **T18** | Post-verification at scale | The sweep was a single unordered sequential loop over every active blog under `curl --max-time 660 --retry 3` — it never finished, and curl retried it three more times while the abandoned handler kept running. Now 4-way sharded (same hash partition as auto-publish, pinned by golden-value tests), concurrency-capped, wall-clock budgeted, ordered least-recently-verified-first so nothing starves, with batched writes, a persisted run summary in `activity_log`, coverage/silence alerts, and a retention prune. `posts_in_period` is a real 7-day count for the first time. The sweep no longer stamps `blogs.lastPostVerifiedAt` — that column is the auto-publish priority key. `vercel.json` deleted (two of its five schedules 404'd, two exactly duplicated Render). Migration `0045`. |
 | **T17** | Cadence integrity | One canonical `blogs.posting_plan integer[7]` replaces four disagreeing columns. New pure module `src/lib/posting-plan.ts`; publisher, verifier, pipeline-alerts, validators, CSV importer, form, admin + portal UIs all read it. Publish window narrowed to 0–17h so no blog has a single tick of runway. `?dry=1` on the auto-publish route. "No posting plan" is now a critical notification and an `activity_log` row, not a discarded JSON string. Migration `0043`; `0044_drop_legacy_cadence.sql.pending` written but inert. |
 
@@ -89,11 +91,10 @@ T03 §8, T04 §8 and T08 §8. **Do not deploy on the strength of this document.*
 
 Grouped by the phase plan; ordering follows T00's dependency map.
 
-**Phase 2 — pipeline integrity (4)**
+**Phase 2 — pipeline integrity (3)**
 
 | | Task | Current state |
 |---|---|---|
-| **T10** | Keyword refresh at scale + ledger draining | `markKeywordTargetFailed` is still terminal while `claimKeywordTargetForBlog` only selects `pending`. T08 stopped *adding* to the failed bucket from two paths; draining it is still open |
 | **T14** | Yoast meta no-op | `updateYoastMeta` still POSTs read-only `yoast_head_json` + unregistered `meta`. WP returns 200, writes nothing, no read-back |
 | **T15** | IndexNow + sitemaps | Still one shared `INDEXNOW_KEY` network-wide. Sitemap submission now exists via T04's `gsc-verifier`; the IndexNow half is open |
 | **T16** | Internal linking | `relinkAfterPublishFireAndForget` still only called from the manual path, never from auto-publish |
@@ -198,6 +199,13 @@ These block acceptance and nobody but a human can do them.
   deploy. T18 §7.
 - **T18 — set `ALERT_EMAIL_TO`** on the web service, or coverage and
   silent-blog alerts are console + `activity_log` only.
+- **T10 — delete `netgrid-cron-refresh-keywords` in the Render dashboard**, and
+  populate `CRON_SECRET` on the four new `...-refresh-keywords-N` services
+  (it is `sync: false`, so Render prompts rather than copying it).
+- **T10 — watch `activity_log` for `keywords.scrape_blocked`** after deploy. If
+  it appears, halve `KEYWORD_SCRAPE_CONCURRENCY` first, then
+  `KEYWORD_REFRESH_MAX_CLIENTS`. Do not "fix" it by spoofing a browser
+  User-Agent — that hides the next block instead of reporting it.
 - **T19, when you get to it, needs a communications plan.** It makes
   client-facing scores drop sharply. T00 §4 is explicit that it should be
   scheduled, not shipped opportunistically.
@@ -216,6 +224,7 @@ The SOPs assume the next free migration is `0039`. It was not — `0039` is
 | `0042_search_console.sql` | T04 |
 | `0043_posting_plan.sql` | T17 |
 | `0045_post_verification_retention.sql` | T18 |
+| `0046_keyword_pipeline_scale.sql` | T10 |
 | `0044_drop_legacy_cadence.sql.pending` | T17 follow-up — **inert**, the runner globs `*.sql` |
 
 If you apply an SOP verbatim, **check the highest existing file first.**
@@ -254,6 +263,21 @@ Flagged deliberately rather than quietly left.
   about** — T22 added it after the SOP was written. Its raw-SQL silence rule
   now derives `expected_hours` from `posting_plan` like everything else. If you
   add another cadence consumer, it reads `posting_plan` or it is a bug.
+- **T10 Step 10 (the budgeted DataForSEO cron) is NOT implemented.** The SOP
+  gates it behind `DATAFORSEO_CRON_ENABLED` and says explicitly that it can
+  ship in a follow-up deploy without blocking the rest. It also spends real
+  money on a schedule and needs a finance-approved
+  `DATAFORSEO_MONTHLY_BUDGET` derived from measured per-seed cost (T10 §5
+  Step 10 has the queries). **T09 depends on it** for keyword difficulty data
+  — do it before starting T09.
+- **T10 reuses `src/lib/cron/sharding.ts` rather than adding the SOP's
+  `src/lib/cron/shard.ts`.** Same function, same SHA1 bytes 8-15; T18 already
+  extracted it. A second copy would be the drift the extraction exists to
+  prevent.
+- **T10 replaced T08's `releaseStuckKeywordTargets`** with a two-window reaper.
+  T08's version ignored `generated_post_id` and could reap a row whose post was
+  mid-publish, handing the same keyword out twice. The old name survives as a
+  shim so the auto-publish hot path did not change.
 - **T03's removal cron and queue table are temporary.** Delete
   `netgrid-cron-link-exchange-removal`, the route, the service file and
   `link_exchange_removals` once the queue drains and is signed off (T03 §7.7).

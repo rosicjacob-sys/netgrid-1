@@ -145,10 +145,25 @@ export const clients = pgTable("clients", {
   status: clientStatusEnum("status").default("onboarding"),
   // Opt-in to the cross-site ABC link-exchange network. Off by default.
   linkExchangeEnabled: boolean("link_exchange_enabled").default(false).notNull(),
+  // Keyword-refresh bookkeeping (see actions/keyword-actions.ts, T10,
+  // migration 0046).
+  //   refreshedAt        — last scrape that actually stored keywords.
+  //   refreshAttemptedAt — last attempt, success or not. This is the sharded
+  //                        cron's fairness cursor: candidates are ordered by
+  //                        it, oldest first, and it is stamped BEFORE the
+  //                        scrape so a crash cannot pin a client at the head
+  //                        of the queue forever.
+  //   refreshFailures    — consecutive empty/blocked scrapes; 0 after any
+  //                        success. Drives the activity_log escalation.
+  keywordsRefreshedAt: timestamp("keywords_refreshed_at"),
+  keywordsRefreshAttemptedAt: timestamp("keywords_refresh_attempted_at"),
+  keywordsRefreshFailures: integer("keywords_refresh_failures").notNull().default(0),
   createdAt: timestamp("created_at").defaultNow().notNull(),
   updatedAt: timestamp("updated_at").defaultNow().notNull(),
 }, (table) => [
   index("clients_status_idx").on(table.status),
+  // The refresh candidate query: stalest-first, nulls first.
+  index("clients_keywords_refresh_idx").on(table.keywordsRefreshAttemptedAt),
 ]);
 
 // ─── 3. blogs ────────────────────────────────────────────────────────────────
@@ -964,6 +979,20 @@ export const blogKeywordTargets = pgTable("blog_keyword_targets", {
     onDelete: "set null",
   }),
   failureReason: text("failure_reason"),
+  // Bounded retry lifecycle (T10, migration 0046).
+  //   attempts     — resolved failures INCLUDING reaper requeues. The row is
+  //                  dead-lettered to 'failed' once this reaches
+  //                  KEYWORD_TARGET_MAX_ATTEMPTS. Before T10, 'failed' was set
+  //                  on the FIRST failure while the claim query only ever
+  //                  selected 'pending' and nothing reset it — so one
+  //                  transient model error permanently deleted that keyword
+  //                  from that blog.
+  //   lastAttemptAt— diagnostics; not read by the claim query.
+  //   nextRetryAt  — cool-off gate. NULL = claimable now (never attempted, or
+  //                  terminal).
+  attempts: integer("attempts").notNull().default(0),
+  lastAttemptAt: timestamp("last_attempt_at"),
+  nextRetryAt: timestamp("next_retry_at"),
   createdAt: timestamp("created_at").defaultNow().notNull(),
   updatedAt: timestamp("updated_at").defaultNow().notNull(),
   generatedAt: timestamp("generated_at"),
@@ -971,6 +1000,17 @@ export const blogKeywordTargets = pgTable("blog_keyword_targets", {
   uniqueIndex("blog_keyword_targets_unique_idx").on(table.blogId, table.keyword, table.city),
   index("blog_keyword_targets_blog_status_priority_idx").on(table.blogId, table.status, table.priority),
   index("blog_keyword_targets_client_idx").on(table.clientId),
+  // The claim query is now (blog_id, status='pending', next_retry_at gate)
+  // ORDER BY attempts, priority — the index above no longer covers it.
+  index("blog_keyword_targets_claim_idx").on(
+    table.blogId,
+    table.status,
+    table.nextRetryAt,
+    table.attempts,
+    table.priority,
+  ),
+  // The reaper: status='generating' AND updated_at < cutoff, network-wide.
+  index("blog_keyword_targets_stranded_idx").on(table.status, table.updatedAt),
 ]);
 
 // ─── registration_leads ───────────────────────────────────────────────────────
