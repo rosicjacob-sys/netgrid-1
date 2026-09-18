@@ -29,6 +29,7 @@ import {
   claimKeywordTargetForBlog,
   markKeywordTargetGenerated,
   markKeywordTargetFailed,
+  markKeywordTargetSkipped,
   releaseKeywordTargetClaim,
   releaseStuckKeywordTargets,
   type ClaimedKeywordTarget,
@@ -45,6 +46,12 @@ import {
   quotaForDate,
   WEEKDAY_NAMES,
 } from "@/lib/posting-plan";
+import {
+  getIdeationCandidatesForBlog,
+  isQueryCoveredByBlog,
+  recordCoveredQuery,
+} from "@/lib/content/topic-candidates";
+import { findMostSimilarTitle } from "@/lib/content/topic-similarity";
 import { ctaColorHex } from "@/lib/content/cta-colors";
 import { resolveNextPostLanguage } from "@/lib/content/post-language";
 import { getAppBaseUrl } from "@/lib/services/link-tracker";
@@ -378,6 +385,28 @@ export async function getRecentTitles(
 }
 
 /**
+ * The duplicate-detection corpus for a ledger-claimed title: the blog's own +
+ * sibling recent titles PLUS its permanent covered-topic history. Same corpus
+ * ideateTopic builds internally — the ledger path previously had none at all.
+ */
+async function buildLedgerDedupCorpus(
+  blogId: string,
+  clientId: string,
+): Promise<string[]> {
+  const [recent, candidateSet] = await Promise.all([
+    getRecentTitles(blogId, clientId),
+    getIdeationCandidatesForBlog(blogId),
+  ]);
+  return Array.from(
+    new Set(
+      [...recent, ...candidateSet.coveredTopics]
+        .map((t) => t.trim())
+        .filter(Boolean),
+    ),
+  );
+}
+
+/**
  * Pick the published sibling posts the generator may weave into the article
  * body as inline <a href> anchors.
  *
@@ -610,11 +639,39 @@ export async function runGenerateAndPublish(
   // ledger row must go back to 'failed' (retryable) rather than 'generated'.
   let generatedViaLocalTarget = false;
 
+  // The query this post covers + the sub-questions the article must answer.
+  // Both are recorded on the post row and, once published, in
+  // blog_covered_queries so this blog can never re-cover the subject.
+  let primaryQuery: string | null = null;
+  let supportingQueries: string[] = [];
+
   if (!topic) {
     if (claimedTarget) {
-      topic = claimedTarget.topicTitle;
-      if (keywords.length === 0) keywords = [claimedTarget.keyword];
-    } else {
+      // The local-keyword ledger used to bypass duplicate detection entirely:
+      // it took claimedTarget.topicTitle verbatim with no similarity check.
+      // Ledger titles are template-built from a CLIENT-WIDE keyword pool, so
+      // two near-identical scraped keywords produce two near-identical titles
+      // on the same blog. Check it against the same corpus ideation uses; on a
+      // hit, retire the ledger row and fall through to ideation.
+      const ledgerCorpus = await buildLedgerDedupCorpus(blog.id, blog.clientId);
+      const ledgerDup = findMostSimilarTitle(claimedTarget.topicTitle, ledgerCorpus);
+      const alreadyCovered = await isQueryCoveredByBlog(blog.id, claimedTarget.keyword);
+      if (ledgerDup || alreadyCovered) {
+        const why = ledgerDup
+          ? `title duplicates "${ledgerDup.title}" (${Math.round(ledgerDup.score * 100)}% word overlap)`
+          : `keyword "${claimedTarget.keyword}" is already covered by this blog`;
+        console.info(
+          `[runGenerateAndPublish] skipping keyword target ${claimedTarget.id} for ${blog.domain}: ${why}`,
+        );
+        await markKeywordTargetSkipped(claimedTarget.id, why);
+      } else {
+        topic = claimedTarget.topicTitle;
+        primaryQuery = claimedTarget.keyword;
+        if (keywords.length === 0) keywords = [claimedTarget.keyword];
+      }
+    }
+
+    if (!topic) {
       const recentTitles = await getRecentTitles(blog.id, blog.clientId);
       const ideated = await ideateTopic(clientNiche, recentTitles, {
         verticalKey: verticalForPost?.key ?? null,
@@ -622,9 +679,29 @@ export async function runGenerateAndPublish(
         language: postLanguage,
         knowledge,
         customPrompt,
+        blogId: blog.id,
       });
+      if (ideated.exhausted) {
+        // Deliberate: refusing to publish beats publishing a known duplicate.
+        // publishOne() treats this as non-transient (no retry) and records it
+        // in the run results, which is exactly the signal an operator needs —
+        // this blog wants a keyword refresh, not another post.
+        throw new Error(
+          `Topic ideation exhausted for ${blog.domain} — every demand-validated ` +
+            `candidate is already covered. Refresh this client's keyword pool ` +
+            `(/api/cron/refresh-keywords or a DataForSEO pull) before it can publish again.`,
+        );
+      }
       topic = ideated.topic;
+      primaryQuery = ideated.primaryQuery;
+      supportingQueries = ideated.supportingQueries;
       if (keywords.length === 0) keywords = ideated.keywords;
+      if (ideated.groundedIn === "fallback") {
+        console.warn(
+          `[runGenerateAndPublish] ${blog.domain}: topic was NOT grounded in query data ` +
+            `(client has no scraped keyword pool)`,
+        );
+      }
     }
   }
 
@@ -674,6 +751,8 @@ export async function runGenerateAndPublish(
         clientId: blog.clientId,
         topic,
         keywords,
+        primaryQuery,
+        supportingQueries,
         status: "generating",
         language: postLanguage,
         isAutoGenerated: true,
@@ -726,6 +805,8 @@ export async function runGenerateAndPublish(
         clientId: blog.clientId,
         topic,
         keywords,
+        primaryQuery,
+        supportingQueries,
         status: "generating",
         language: postLanguage,
         isAutoGenerated: false,
@@ -803,6 +884,8 @@ export async function runGenerateAndPublish(
       brandName: blog.brandName,
       internalLinkRefs,
       knowledgeSummaries: knowledge.summaries,
+      // Consumed by the article prompt in T05. Inert until then.
+      supportingQueries,
       localTarget: useLocalTarget ? localTarget : undefined,
       cta,
       // T02: the money link points at the client's real destination, not at
@@ -891,14 +974,23 @@ export async function runGenerateAndPublish(
             language: postLanguage,
             knowledge,
             customPrompt,
+            blogId: blog.id,
           },
         );
+        if (newIdea.exhausted) {
+          throw new Error(
+            "Re-ideation exhausted: every demand-validated candidate for this blog is already covered",
+          );
+        }
         if (!newIdea.topic || newIdea.topic.trim() === currentTopic.trim()) {
           throw new Error("Re-ideation returned an empty or duplicate topic");
         }
         currentTopic = newIdea.topic;
         currentKeywords =
           newIdea.keywords.length > 0 ? newIdea.keywords : currentKeywords;
+        // The recovery topic replaces the original subject entirely.
+        primaryQuery = newIdea.primaryQuery;
+        supportingQueries = newIdea.supportingQueries;
         // The recovery attempt writes about something else, so the topical
         // link candidates picked for the ABANDONED topic no longer apply.
         // Costs one more embedding call on a path that is already re-running
@@ -915,6 +1007,8 @@ export async function runGenerateAndPublish(
           .set({
             topic: currentTopic,
             keywords: currentKeywords,
+            primaryQuery,
+            supportingQueries,
             updatedAt: new Date(),
           })
           .where(eq(generatedPosts.id, generatedPostId));
@@ -1213,6 +1307,20 @@ export async function runGenerateAndPublish(
       }
     }
 
+    // Permanent coverage record. Written only after the post is LIVE, so a
+    // failed generation or publish leaves the query in the pool for a future
+    // run. Never throws — see recordCoveredQuery.
+    if (primaryQuery) {
+      await recordCoveredQuery({
+        blogId: blog.id,
+        clientId: blog.clientId,
+        query: primaryQuery,
+        topic: content.title || topic,
+        generatedPostId,
+        source: claimedTarget ? "ledger" : "ideation",
+      });
+    }
+
     return {
       success: true,
       generatedPostId,
@@ -1478,13 +1586,21 @@ export async function suggestTopicForBlog(
   await requireAdmin();
   const ctx = await resolveIdeationContext(blogId);
   const recentTitles = await getRecentTitles(blogId, ctx.blog.clientId);
-  return ideateTopic(ctx.clientNiche, recentTitles, {
+  const ideated = await ideateTopic(ctx.clientNiche, recentTitles, {
     verticalKey: ctx.verticalKey,
     styleProfile: ctx.styleProfile ?? undefined,
     language: ctx.language,
     knowledge: ctx.knowledge,
     customPrompt: ctx.customPrompt,
+    blogId,
   });
+  if (ideated.exhausted) {
+    // GeneratePostButton catches and toasts e.message — no component change.
+    throw new Error(
+      "Every demand-validated query for this blog is already covered. Refresh the client's keyword pool, then try again.",
+    );
+  }
+  return { topic: ideated.topic, keywords: ideated.keywords };
 }
 
 /**

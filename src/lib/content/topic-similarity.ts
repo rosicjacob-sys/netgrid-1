@@ -11,23 +11,52 @@
  * embedding call. English + French stopwords since blogs can be either.
  */
 
-const STOPWORDS = new Set([
-  // English
-  "a", "an", "the", "for", "to", "in", "of", "and", "or", "how", "much",
-  "take", "guide", "best", "buy", "what", "is", "are", "your", "you", "with",
-  "on", "at", "by", "from", "vs", "which", "when", "where", "why", "do",
-  "does", "can", "should", "this", "that", "it", "as", "be", "not",
-  // French
-  "le", "la", "les", "de", "des", "du", "au", "aux", "en", "pour", "et",
-  "ou", "comment", "combien", "prendre", "votre", "vous", "avec", "sur",
-  "est", "sont", "que", "qui", "où", "quel", "quelle", "un", "une", "dans",
-  "ce", "cette",
-]);
+/**
+ * Strip combining diacritics: "protéine" -> "proteine", "Québec" -> "quebec".
+ *
+ * This is load-bearing, not cosmetic. tokenize() splits on /[^a-z0-9]+/, which
+ * treats every accented Latin letter as a DELIMITER — so before this fold,
+ * "protéine" tokenized to ["prot", "ine"] and two identical French titles
+ * written with and without accents scored 0.08 similarity instead of 1.00.
+ * Every French blog in the network was effectively running with no
+ * near-duplicate detection at all.
+ *
+ * ES2022 target (see tsconfig.json), so \p{Diacritic} with the /u flag is
+ * available natively.
+ */
+function foldAccents(input: string): string {
+  return input.normalize("NFD").replace(/\p{Diacritic}/gu, "");
+}
 
-/** "BPC-157" and "TB-500" fuse into single tokens (bpc157, tb500) so a
- * compound name isn't accidentally split into two separate words. */
+// Folded at module load so the French entries actually match folded tokens.
+// ("où" folds to "ou", which the raw list already contains — Set dedupes it.
+// Before the fold, the "où" entry was unreachable: tokenize could never emit
+// a token containing "ù".)
+const STOPWORDS = new Set(
+  [
+    // English
+    "a", "an", "the", "for", "to", "in", "of", "and", "or", "how", "much",
+    "take", "guide", "best", "buy", "what", "is", "are", "your", "you", "with",
+    "on", "at", "by", "from", "vs", "which", "when", "where", "why", "do",
+    "does", "can", "should", "this", "that", "it", "as", "be", "not",
+    // French
+    "le", "la", "les", "de", "des", "du", "au", "aux", "en", "pour", "et",
+    "ou", "comment", "combien", "prendre", "votre", "vous", "avec", "sur",
+    "est", "sont", "que", "qui", "où", "quel", "quelle", "un", "une", "dans",
+    "ce", "cette",
+  ].map(foldAccents),
+);
+
+/**
+ * "BPC-157" and "TB-500" fuse into single tokens (bpc157, tb500) so a
+ * compound name isn't accidentally split into two separate words. Accents are
+ * folded first (see foldAccents) and apostrophes become separators so
+ * "l'entraînement" yields "entrainement" rather than "lentrainement".
+ */
 function tokenize(title: string): Set<string> {
-  const normalized = title.toLowerCase().replace(/-/g, "");
+  const normalized = foldAccents(title.toLowerCase())
+    .replace(/['’ʼ]/g, " ")
+    .replace(/-/g, "");
   const tokens = normalized
     .split(/[^a-z0-9]+/)
     .filter((t) => t.length > 1 && !STOPWORDS.has(t));
@@ -67,4 +96,24 @@ export function findMostSimilarTitle(
     }
   }
   return best;
+}
+
+/**
+ * Canonical key for a search query, used as the uniqueness key of
+ * blog_covered_queries. Same normalisation pipeline as tokenize() so a query
+ * and a title are folded identically — stopwords are NOT removed here, since
+ * this is an identity key for a query, not a bag-of-words for similarity.
+ *
+ *   "BPC-157 Dosage — Québec"  -> "bpc157 dosage quebec"
+ *   "  bpc157   dosage quebec" -> "bpc157 dosage quebec"
+ *
+ * Returns "" for a query with no alphanumeric content; callers must skip those
+ * rather than write an empty key.
+ */
+export function normalizeQueryKey(query: string): string {
+  return foldAccents(query.toLowerCase())
+    .replace(/['’ʼ]/g, " ")
+    .replace(/-/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
 }

@@ -525,6 +525,31 @@ export async function markKeywordTargetFailed(id: string, reason: string): Promi
 }
 
 /**
+ * Retire a claimed target that must NOT be written: its templated title
+ * duplicates an existing post, or the blog has already covered its keyword.
+ * 'skipped' is terminal — claimKeywordTargetForBlog only ever selects
+ * status='pending' — which is what we want here, unlike 'failed' (a transient
+ * generation problem worth surfacing to the operator and retrying).
+ */
+export async function markKeywordTargetSkipped(id: string, reason: string): Promise<void> {
+  try {
+    await db
+      .update(blogKeywordTargets)
+      .set({
+        status: "skipped",
+        failureReason: reason.slice(0, 2000),
+        updatedAt: new Date(),
+      })
+      .where(eq(blogKeywordTargets.id, id));
+  } catch (err) {
+    console.warn(
+      `[keyword-target] failed to mark ${id} skipped:`,
+      err instanceof Error ? err.message : err,
+    );
+  }
+}
+
+/**
  * Hand a claimed target straight back to the pool, untouched (T08).
  *
  * Used when the run that claimed it never actually started work — today the

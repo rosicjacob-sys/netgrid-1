@@ -60,7 +60,7 @@ the operator actions below are still required.
 
 ---
 
-## Status: 15 of 26 done, 11 remaining — **Phase 3 started**
+## Status: 16 of 26 done, 10 remaining — **Phase 3 in progress**
 
 ### Done before this session
 
@@ -84,23 +84,32 @@ the operator actions below are still required.
 | **T14** | Yoast meta no-op | Every Yoast WordPress post published with the theme's default title and no meta description, while the log said "(SEO meta set)". Three independent reasons, all returning HTTP 200. Fixed: new `docs/wordpress/netgrid-seo-bridge.php` MU-plugin registers the real `_yoast_wpseo_*` keys for REST with an `auth_callback` and refreshes Yoast's indexable cache; `updateYoastMeta` writes those keys and throws when the bridge is absent; every write is now confirmed against the live `<head>` before anything is called a success. `metaStatus: "written"` now requires live verification. Per-post result persisted on `generated_posts`, bridge version per blog, and a measure-then-repair backfill. Migration `0047`. |
 | **T10** | Keyword pipeline at scale + ledger draining | The weekly refresh scraped every client in one unordered sequential pass (~5 h at 1,500 clients), so it never returned and the ledger rebuild after it never ran at all. Now 4-way sharded, hourly, staggered, with a staleness cursor on `clients.keywords_refresh_attempted_at` stamped *before* the scrape. `markKeywordTargetFailed` no longer buries a row in `failed` on the first transient error — bounded retries with a cool-off, dead-lettering only once the budget is spent, plus a two-window reaper that respects in-flight posts. Scrape locales now come from the client's own blogs instead of guessing from `language_mode`. A blocked scrape is reported instead of looking like "no results". The DataForSEO provenance downgrade is fixed. Migration `0046`, which also releases the existing permanent graves. |
 | **T18** | Post-verification at scale | The sweep was a single unordered sequential loop over every active blog under `curl --max-time 660 --retry 3` — it never finished, and curl retried it three more times while the abandoned handler kept running. Now 4-way sharded (same hash partition as auto-publish, pinned by golden-value tests), concurrency-capped, wall-clock budgeted, ordered least-recently-verified-first so nothing starves, with batched writes, a persisted run summary in `activity_log`, coverage/silence alerts, and a retention prune. `posts_in_period` is a real 7-day count for the first time. The sweep no longer stamps `blogs.lastPostVerifiedAt` — that column is the auto-publish priority key. `vercel.json` deleted (two of its five schedules 404'd, two exactly duplicated Render). Migration `0045`. |
+| **T11** | Ideation grounding | Topic ideation asked a model to invent both the subject and the target keywords from a niche label, then — when its own duplicate check failed three times — **published the duplicate anyway** with a `console.warn`. The database already held real query data (`client_keywords`, with volume and difficulty from the DataForSEO pull); ideation reached none of it in a usable shape. The dedup window was 24 titles, so a blog posting daily forgot what it wrote 13 days ago and the collision rate rose with the blog's age. And the tokenizer split on `[^a-z0-9]`, treating every accented letter as a delimiter — two identical French sentences scored **0.08**, so every French blog had no duplicate detection at all. Now: `ideateTopic` selects an **angle** over a supplied, demand-ranked, already-filtered candidate list; a permanent `blog_covered_queries` table replaces the 24-title window; the accept-the-duplicate branch is gone (exhaustion refuses to publish instead); the ledger path is no longer exempt from duplicate detection; and `temperature` drops 0.9 → 0.35 for what should be the least creative decision in the pipeline. Migration `0050`. |
 | **T13** | Composer repair | Every non-peptide blog in the network was writing from **one** template. `buildStructuralPool` filtered on `subNicheFit` at all three tiers, and no template declares a sub-niche above 13 — so the pool came back `[]` for sub-niches 14-90 and `pickTemplateForPost` silently served `TEMPLATES[1]`, peptide section labels ("Mechanism — how the compound works at cellular level") included, on every roofing, loans and casino post ever published. Separately `archetypeForVoice` scanned only the `voiceRange` bands, which stop at V77, so all 50 cross-niche voices collapsed onto archetype 1 and 5 of 12 skeletons were unreachable. Now: 22 niche-neutral flow variants (`CROSS_NICHE_FLOWS`), a 6-tier pool ladder with a sub-niche-agnostic floor, `archetypeForVoice` reading the voice's declared archetype, and the three dead compatibility guards (`SubNiche`, `Cadence`, `Strictness`) finally called. Two strings that were being ordered into published HTML are gone: the literal `(no compliance phrase required for this niche)` and the raw token `{citation.style}`. No migration — data repair only, via `src/lib/db/repair-structural-pools.ts`. |
 | **T17** | Cadence integrity | One canonical `blogs.posting_plan integer[7]` replaces four disagreeing columns. New pure module `src/lib/posting-plan.ts`; publisher, verifier, pipeline-alerts, validators, CSV importer, form, admin + portal UIs all read it. Publish window narrowed to 0–17h so no blog has a single tick of runway. `?dry=1` on the auto-publish route. "No posting plan" is now a critical notification and an `activity_log` row, not a discarded JSON string. Migration `0043`; `0044_drop_legacy_cadence.sql.pending` written but inert. |
 
-### Remaining: 11
+### Remaining: 10
 
 Grouped by the phase plan; ordering follows T00's dependency map.
 
-**Phase 3 — content & targeting (6 of 7 left)**
+**Phase 3 — content & targeting (5 of 7 left)**
 
-`T13` composer repair is **done**. Next: `T09` winnability → `T11` ideation
-grounding → `T05` prompt rewrite → `T21` prompt contradictions; plus `T12`
-author entities → `T20` FAQ structured data. **Order is load-bearing:**
-composer before prompts, difficulty before winnability before ideation.
+`T13` composer repair and `T11` ideation grounding are **done**. Next: `T05`
+prompt rewrite → `T21` prompt contradictions; plus `T12` author entities →
+`T20` FAQ structured data. `T09` winnability sits outside that order (below).
+
+T11 was taken ahead of T09 deliberately, and the SOP sanctions it: T11 defines
+the ranking seam (`rankedQueriesForClient` in
+`src/lib/content/topic-candidates.ts`) and ships a working default that
+reproduces today's ordering from `client_keywords`. **T09 replaces that one
+function body and nothing else** — the candidate rendering, covered-query
+filtering and sibling spread are all unchanged. Its contract: at most `limit`
+rows, best first, `demand` = monthly volume or null, `difficulty` = 0-100 or
+null, `rank` = 0-based index in the returned order.
 
 `T09` is **blocked** on a `DATAFORSEO_MONTHLY_BUDGET` figure — T10 Step 10 (the
 budgeted DataForSEO cron) was deliberately not built pending that sign-off, and
-T09's difficulty scoring depends on it.
+T09's difficulty scoring depends on it. T05 is the natural next task.
 
 **Phase 4 — hygiene (5)**
 
@@ -138,6 +147,18 @@ reading it. Worth knowing about because the SOPs are otherwise reliable.
 
 These block acceptance and nobody but a human can do them.
 
+- **T11 — run the covered-query backfill immediately after `db:migrate`, and
+  before the next hourly auto-publish tick.** `npm run db:backfill-covered-queries
+  -- --dry-run`, then without the flag. Without it every live blog starts with
+  an empty covered-query history and will happily re-cover subjects it
+  published last month. Idempotent — a second run must insert 0.
+- **T11 — ship with `IDEATION_REQUIRE_CANDIDATES` unset.** Grounding is on
+  wherever a keyword pool exists; clients with no pool keep publishing via the
+  ungrounded fallback. Watch the grounding-coverage rate
+  (`primary_query IS NOT NULL` on `generated_posts`) for 48 hours, trigger
+  keyword refreshes for the clients with no pool, and only flip the flag to
+  `true` once coverage is above ~95%. From then on an ungrounded post is
+  impossible.
 - **T13 — run the structural-pool repair after this deploys, not before.**
   `npx tsx src/lib/db/repair-structural-pools.ts --dry-run`, read the sample,
   then run it without the flag. It rebuilds the empty `structural_pool` arrays
@@ -273,6 +294,38 @@ If you apply an SOP verbatim, **check the highest existing file first.**
 
 Flagged deliberately rather than quietly left.
 
+- **T11 deliberately makes some blogs stop publishing.** A blog that has
+  covered every demand-validated query in its client's pool now returns
+  `exhausted: true` and publishes **nothing**, where the old code published a
+  topic it had already measured as a 40%-overlap duplicate. This is the
+  intended behaviour and it is measurable. Do **not** "fix" it by restoring the
+  accept-the-duplicate branch — a blog that has genuinely exhausted its pool
+  needs a keyword refresh (`/api/cron/refresh-keywords` or a DataForSEO pull),
+  not another rehash. The exhausted message classifies as non-transient
+  (`isTransientFailure` in `publish-slots.ts` matches none of its substrings),
+  so `publishOne` reports it exactly once without burning a retry — verified by
+  reading the classifier, not assumed.
+- **T11 makes the weekly keyword-refresh cron operationally load-bearing.**
+  `netgrid-cron-refresh-keywords` (Mondays 03:00 UTC) is now what replenishes a
+  blog's ability to publish *at all*. A client whose scrape has stalled will hit
+  exhaustion instead of quietly emitting invented topics. Watch the exhaustion
+  count as a keyword-freshness alarm.
+- **T11's manual path records coverage at draft-persist time, not publish
+  time**, because otherwise the next run re-ideates straight into the draft's
+  subject. A draft the operator later deletes therefore leaves an orphan
+  coverage row — `generated_post_id` is `ON DELETE SET NULL`, not cascade, and
+  that is deliberate: deleting a post should not silently free its subject for
+  immediate re-coverage. To genuinely release them:
+  `DELETE FROM blog_covered_queries WHERE generated_post_id IS NULL AND source
+  <> 'backfill' AND covered_at < now() - interval '7 days';` Run it manually,
+  never on a schedule.
+- **`normalizeQueryKey` and `tokenize` must not drift.** The backfill writes
+  `query_norm` through the TS helper and the runtime matches on it; two
+  normalisation implementations would mean the backfill writes keys the runtime
+  can never match, and every blog silently restarts from an empty history.
+  This is why the key is never computed in SQL, and why
+  `ideation-grounding.test.ts` asserts the two pipelines agree. If you ever
+  need it in Postgres, it needs the `unaccent` extension and it will drift.
 - **T13 found four peptide-vocabulary leaks the SOP did not list**, and its
   own acceptance criteria could not pass without fixing them. The SOP treats
   `templates.ts` as the only library carrying peptide-specific text. It is

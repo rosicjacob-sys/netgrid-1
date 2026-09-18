@@ -1,5 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { titleSimilarity, findMostSimilarTitle } from "./topic-similarity";
+import {
+  titleSimilarity,
+  findMostSimilarTitle,
+  normalizeQueryKey,
+} from "./topic-similarity";
 
 describe("titleSimilarity", () => {
   it("scores near-identical titles high", () => {
@@ -61,5 +65,49 @@ describe("findMostSimilarTitle", () => {
   it("returns undefined when nothing meets the threshold", () => {
     const match = findMostSimilarTitle("Semaglutide Weight Loss", ["BPC-157 Tendon Repair"]);
     expect(match).toBeUndefined();
+  });
+});
+
+describe("titleSimilarity — accent folding", () => {
+  it("treats the same French sentence with and without accents as identical", () => {
+    // Before the foldAccents fix this scored 0.0833 — below the 0.4
+    // threshold — so it sailed through as "not a duplicate".
+    const score = titleSimilarity(
+      "Créatine et récupération musculaire après l'entraînement",
+      "Creatine et recuperation musculaire apres l entrainement",
+    );
+    expect(score).toBe(1);
+  });
+
+  it("does not shatter an accented word into fragments", () => {
+    // "protéine" used to become "prot" + "ine"; unrelated French titles then
+    // shared those fragments and scored spuriously high.
+    const score = titleSimilarity(
+      "Sémaglutide : effets secondaires fréquents",
+      "Créatine : bénéfices prouvés",
+    );
+    expect(score).toBe(0);
+  });
+
+  it("splits on the French elision apostrophe", () => {
+    const score = titleSimilarity(
+      "L'impact de la créatine sur l'endurance",
+      "Impact de la creatine sur endurance",
+    );
+    expect(score).toBe(1);
+  });
+});
+
+describe("normalizeQueryKey", () => {
+  it("folds accents, fuses hyphens and collapses whitespace", () => {
+    expect(normalizeQueryKey("BPC-157 Dosage — Québec")).toBe("bpc157 dosage quebec");
+  });
+
+  it("is stable across spacing and casing variants", () => {
+    expect(normalizeQueryKey("  bpc157   DOSAGE  quebec ")).toBe("bpc157 dosage quebec");
+  });
+
+  it("returns an empty string when there is nothing alphanumeric", () => {
+    expect(normalizeQueryKey("— ??? —")).toBe("");
   });
 });

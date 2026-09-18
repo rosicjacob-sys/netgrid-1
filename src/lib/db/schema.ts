@@ -436,6 +436,15 @@ export const generatedPosts = pgTable("generated_posts", {
   clientId: uuid("client_id").notNull().references(() => clients.id, { onDelete: "cascade" }),
   topic: varchar("topic", { length: 500 }).notNull(),
   keywords: jsonb("keywords"),
+  // The demand-validated candidate query this post was built to cover, copied
+  // verbatim from the ranked pool. Null on the ungrounded fallback path (a
+  // client with no scraped keywords yet) and on posts predating T11 — that
+  // null-rate IS the grounding-coverage metric.
+  primaryQuery: varchar("primary_query", { length: 255 }),
+  // 3-6 real sub-questions the article is required to answer, chosen by
+  // ideation from the same query pool. Persisted here as an audit trail;
+  // consumed by the article prompt (T05).
+  supportingQueries: jsonb("supporting_queries"),
   title: varchar("title", { length: 500 }),
   body: text("body"),
   excerpt: text("excerpt"),
@@ -1045,6 +1054,53 @@ export const blogKeywordTargets = pgTable("blog_keyword_targets", {
   ),
   // The reaper: status='generating' AND updated_at < cutoff, network-wide.
   index("blog_keyword_targets_stranded_idx").on(table.status, table.updatedAt),
+]);
+
+// ─── blog_covered_queries ─────────────────────────────────────────────────────
+//
+// PERMANENT per-blog record of which search queries a blog has already
+// covered. This replaces the 24-title dedup window (getRecentTitles: 12 own +
+// 12 sibling titles) that ideation used to rely on — a window that made a
+// two-year-old blog forget everything older than about two weeks and re-cover
+// the same subjects indefinitely.
+//
+// One row = "this blog has published a post whose subject is this query".
+// query_norm is normalizeQueryKey(query) (see content/topic-similarity.ts) and
+// is the uniqueness key, so accent/case/hyphen/spacing variants of the same
+// query collapse to one row. Written by recordCoveredQuery() after a post is
+// published (auto-publish) or persisted (manual generate); read by
+// getIdeationCandidatesForBlog() to remove already-covered queries from the
+// candidate list BEFORE the model ever sees them.
+//
+// client_id is denormalised from the blog so sibling blogs of the same client
+// can be consulted cheaply (a query a sibling already covered is
+// deprioritised, not removed — see getIdeationCandidatesForBlog).
+export const blogCoveredQueries = pgTable("blog_covered_queries", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  blogId: uuid("blog_id")
+    .notNull()
+    .references(() => blogs.id, { onDelete: "cascade" }),
+  clientId: uuid("client_id")
+    .notNull()
+    .references(() => clients.id, { onDelete: "cascade" }),
+  // The query exactly as it appeared in the candidate list / ledger row.
+  query: varchar("query", { length: 255 }).notNull(),
+  // normalizeQueryKey(query) — the dedup key. Never write this by hand in SQL;
+  // always go through the TS helper so the runtime and any backfill agree.
+  queryNorm: varchar("query_norm", { length: 255 }).notNull(),
+  // The angle/title actually published for this query. Fed back into the
+  // similarity corpus so a future post can't re-word an old angle either.
+  topic: varchar("topic", { length: 500 }).notNull(),
+  generatedPostId: uuid("generated_post_id").references(() => generatedPosts.id, {
+    onDelete: "set null",
+  }),
+  // "ideation" | "ledger" | "backfill" — where the coverage came from.
+  source: varchar("source", { length: 16 }).notNull().default("ideation"),
+  coveredAt: timestamp("covered_at").defaultNow().notNull(),
+}, (table) => [
+  uniqueIndex("blog_covered_queries_blog_query_idx").on(table.blogId, table.queryNorm),
+  index("blog_covered_queries_client_query_idx").on(table.clientId, table.queryNorm),
+  index("blog_covered_queries_blog_covered_at_idx").on(table.blogId, table.coveredAt),
 ]);
 
 // ─── registration_leads ───────────────────────────────────────────────────────

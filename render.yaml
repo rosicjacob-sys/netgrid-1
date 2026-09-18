@@ -137,6 +137,13 @@ services:
       # three without a deploy and leaves the backfill cron as the only writer.
       - key: SEMANTIC_LINK_ON_PUBLISH
         sync: false
+      # Topic ideation grounding (T11). Unset/false: a client with no scraped
+      # keyword pool falls back to ungrounded invention so it keeps publishing.
+      # "true": ideation refuses instead, and no post is ever published against
+      # a query nobody searches for. Flip this once grounding coverage is high
+      # (the monitoring queries are in docs/remediation-status.md).
+      - key: IDEATION_REQUIRE_CANDIDATES
+        sync: false
       # Share of a backfill run's budget reserved for RE-linking posts whose
       # neighbourhood has changed since they were last linked. Default 0.6.
       # The rest goes to never-linked posts; unused NEW budget rolls into
