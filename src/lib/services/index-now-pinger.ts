@@ -25,7 +25,11 @@
  * --- What this module does NOT do ---
  *
  * - Does NOT ping Google. Google does not support IndexNow. The Google path
- *   is sitemap re-ping via the Search Console API — a separate follow-up.
+ *   is the Search Console integration in src/lib/services/gsc-client.ts:
+ *   sitemaps.submit runs once per property at onboarding (gsc-verifier.ts),
+ *   and index coverage is read back per URL by gsc-index-coverage.ts. Google
+ *   has no push-on-publish equivalent to IndexNow, so there is deliberately
+ *   nothing to call from this module's publish path.
  * - Does NOT host the key file. That's per-platform deployment (MU-plugin
  *   on WP, Page/redirect on Shopify).
  * - Does NOT batch across multiple URLs. We submit one URL per publish; the

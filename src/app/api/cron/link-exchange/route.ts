@@ -1,35 +1,34 @@
 import { NextResponse } from "next/server";
-import { verifyCronSecret } from "@/lib/auth/helpers";
-import { runLinkExchange } from "@/lib/services/link-exchange";
-
-// Placement fetches + re-pushes live post bodies across platforms; give it room.
-export const maxDuration = 600;
 
 /**
- * Link-exchange cron. Builds new ABC loops from opt-in same-niche blogs, then
- * drips a capped number of body-text exchange links into existing posts (≤1
- * per source blog per run). Deliberately low-volume to match natural pace.
+ * RETIRED (T03) — the link exchange is permanently shut down.
  *
- * GET /api/cron/link-exchange?limit=10
+ * This route deliberately imports nothing from
+ * @/lib/services/link-exchange. A stale Render cron service, a forgotten
+ * uptime check, or a hand-rolled curl cannot resume placements through it,
+ * regardless of what the service module does.
+ *
+ * It answers 410 Gone (not 404) so a caller's logs say "this endpoint was
+ * removed on purpose" rather than "someone broke the routing". It is
+ * deliberately unauthenticated: nothing happens and nothing is disclosed, and
+ * a 401 would hide the fact that a stale caller still exists.
+ *
+ * Links already placed on live posts are removed by
+ * /api/cron/link-exchange-removal.
  */
-export async function GET(request: Request) {
-  if (!verifyCronSecret(request)) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+export async function GET() {
+  console.warn(
+    "[link-exchange] retired endpoint /api/cron/link-exchange was called — " +
+      "a stale cron service or external caller still exists; find and remove it",
+  );
 
-  const url = new URL(request.url);
-  const limitParam = url.searchParams.get("limit");
-  const limit = limitParam !== null ? Number(limitParam) : undefined;
-
-  try {
-    const result = await runLinkExchange({
-      limit: Number.isFinite(limit) ? limit : undefined,
-    });
-    return NextResponse.json(result);
-  } catch (error) {
-    console.error("Link-exchange cron error:", error);
-    const message =
-      error instanceof Error ? error.message : "Link exchange failed";
-    return NextResponse.json({ error: message }, { status: 500 });
-  }
+  return NextResponse.json(
+    {
+      error: "Gone",
+      message:
+        "The link exchange was retired (T03) and cannot be run. " +
+        "Removal of already-placed links runs at /api/cron/link-exchange-removal.",
+    },
+    { status: 410 },
+  );
 }

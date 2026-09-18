@@ -206,12 +206,38 @@ export const blogs = pgTable("blogs", {
   // Null means "don't touch the shop's existing metafields."
   homepageMetaTitle: varchar("homepage_meta_title", { length: 70 }),
   homepageMetaDescription: varchar("homepage_meta_description", { length: 320 }),
+  // ── Google Search Console (T04) ──
+  // gscSiteUrl is the property identifier every Search Console call is made
+  // with. Two shapes, decided by the verification method:
+  //   "sc-domain:example.com"  Domain property   (DNS_TXT verified)
+  //   "https://example.com/"   URL-prefix property (META verified)
+  // Null until the property is verified AND registered via sites.add.
+  gscSiteUrl: varchar("gsc_site_url", { length: 255 }),
+  // "DNS_TXT" | "META". Chosen by platform — see gsc-verifier.methodForBlog.
+  gscVerificationMethod: varchar("gsc_verification_method", { length: 16 }),
+  // The token Google handed back. For DNS_TXT this IS the operator
+  // deliverable (the TXT value to publish at the apex); for META it is the
+  // full <meta> tag we wrote into the theme.
+  gscVerificationToken: text("gsc_verification_token"),
+  gscVerifiedAt: timestamp("gsc_verified_at"),
+  gscSitemapSubmittedAt: timestamp("gsc_sitemap_submitted_at"),
+  // Last successful searchanalytics pull. Drives the sync cron's ordering
+  // (NULLS FIRST = never-synced blogs jump the queue) and lets the alert
+  // distinguish "suppressed site" from "broken cron".
+  gscLastSyncedAt: timestamp("gsc_last_synced_at"),
+  // Stamped when the 16-month historical pull completed for this blog, so
+  // the backfill mode can be re-run to completion without redoing work.
+  gscBackfilledAt: timestamp("gsc_backfilled_at"),
   createdAt: timestamp("created_at").defaultNow().notNull(),
   updatedAt: timestamp("updated_at").defaultNow().notNull(),
 }, (table) => [
   uniqueIndex("blogs_domain_idx").on(table.domain),
   index("blogs_client_id_idx").on(table.clientId),
   index("blogs_status_idx").on(table.status),
+  // Partial index: the sync cron's candidate query is
+  //   status = 'active' AND gsc_verified_at IS NOT NULL
+  // over the whole table, every run, on every shard.
+  index("blogs_gsc_synced_idx").on(table.gscLastSyncedAt),
 ]);
 
 // ─── 4. seo_scans ───────────────────────────────────────────────────────────
@@ -1062,9 +1088,13 @@ export const appSettings = pgTable("app_settings", {
 // Not FK-constrained so the log survives post/blog deletion. Ids are stored
 // loosely (nullable) for the same reason.
 // ─── link_exchange_loops / link_exchange_edges ──────────────────────────────
-// Cross-site ABC linking. A loop is a directed cycle of topically related,
-// opt-in blogs (A→B→C→A); each edge is one directed link with its anchor and
-// placement record. See src/lib/services/link-exchange.ts.
+// RETIRED (T03). Read-only history of the link-exchange scheme. A "loop" row
+// was one client's FULL MESH (every site linking to every other site it owns —
+// NOT the ABC cycle the original comment described); each edge is one directed
+// link with its anchor and placement record.
+// Statuses now in use: "pending" (legacy), "placed", "failed",
+//   "disabled" (never placed, terminated by migration 0041),
+//   "removed"  (was live, stripped by the removal job).
 export const linkExchangeLoops = pgTable("link_exchange_loops", {
   id: uuid("id").defaultRandom().primaryKey(),
   // One loop per client — the client's full mesh of interlinked sites.
@@ -1103,6 +1133,38 @@ export const linkExchangeEdges = pgTable("link_exchange_edges", {
   index("link_exchange_edges_source_idx").on(table.sourceBlogId),
 ]);
 
+// ─── link_exchange_removals ─────────────────────────────────────────────────
+// Durable work queue for the T03 link-exchange teardown. One row per published
+// post that must be checked for a `data-nx-exch` link left behind by the
+// retired exchange. All progress lives here rather than in memory, so the
+// removal job is restartable, idempotent and observable in SQL.
+//
+//   priority 0 → a placed edge points at this post: it is known to carry a link
+//   priority 1 → swept in because its blog ever hosted an exchange link
+//   status     → "pending" | "clean" | "removed" | "failed"
+//
+// previous_body holds the exact live body as it was BEFORE the strip, so a
+// single post can be restored (see restoreRemovedPost). Null it out once the
+// drain has been signed off.
+export const linkExchangeRemovals = pgTable("link_exchange_removals", {
+  postId: uuid("post_id")
+    .primaryKey()
+    .references(() => generatedPosts.id, { onDelete: "cascade" }),
+  blogId: uuid("blog_id").notNull().references(() => blogs.id, { onDelete: "cascade" }),
+  priority: integer("priority").default(1).notNull(),
+  status: varchar("status", { length: 16 }).default("pending").notNull(),
+  linksRemoved: integer("links_removed").default(0).notNull(),
+  attempts: integer("attempts").default(0).notNull(),
+  lastError: text("last_error"),
+  previousBody: text("previous_body"),
+  checkedAt: timestamp("checked_at"),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().notNull(),
+}, (table) => [
+  index("link_exchange_removals_queue_idx").on(table.status, table.priority),
+  index("link_exchange_removals_blog_idx").on(table.blogId),
+]);
+
 export const linkEvents = pgTable("link_events", {
   id: uuid("id").defaultRandom().primaryKey(),
   postId: uuid("post_id"),
@@ -1117,4 +1179,100 @@ export const linkEvents = pgTable("link_events", {
   index("link_events_blog_idx").on(table.blogId, table.type),
   index("link_events_client_idx").on(table.clientId, table.type),
   index("link_events_created_idx").on(table.createdAt),
+]);
+
+// ─── search_performance ──────────────────────────────────────────────────────
+//
+// Google Search Console performance rows: one per (blog x date x query x page).
+// Pulled by /api/cron/gsc-sync from searchanalytics.query and UPSERTED, so
+// re-running a window is idempotent — which matters because Google keeps
+// revising the most recent ~3 days after first publishing them.
+//
+// `date` is a Search Console date: America/Los_Angeles, NOT UTC. See
+// gscToday() in gsc-sync.ts — asking for a UTC "today" returns an empty day
+// for eight hours out of every twenty-four.
+//
+// `position` is the average SERP position for that row, fractional exactly as
+// Google returns it (e.g. 13.47). Stored as numeric, not a float, so AVG()
+// across millions of rows is exact and comparable between runs. Drizzle
+// returns numeric as a string — see the insert in gsc-sync.upsertRows.
+//
+// `ctr` is deliberately absent: it is exactly clicks / impressions and storing
+// it would create a second source of truth for one division.
+//
+// `rowHash` = sha256(query || '\0' || page), computed AFTER truncation so the
+// hash always describes what is actually stored. It exists for one reason: a
+// btree index entry cannot exceed ~2,704 bytes, and (query, page) in UTF-8
+// can. A natural unique index on (blog_id, date, query, page) would work for
+// months and then abort an entire 500-row upsert batch the first time one long
+// URL arrives. Hashing makes the key a fixed 64 bytes. query and page are
+// still stored verbatim and are still queryable.
+export const searchPerformance = pgTable("search_performance", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  blogId: uuid("blog_id").notNull().references(() => blogs.id, { onDelete: "cascade" }),
+  clientId: uuid("client_id").notNull().references(() => clients.id, { onDelete: "cascade" }),
+  date: date("date", { mode: "string" }).notNull(),
+  query: varchar("query", { length: 500 }).notNull(),
+  page: varchar("page", { length: 2048 }).notNull(),
+  rowHash: varchar("row_hash", { length: 64 }).notNull(),
+  clicks: integer("clicks").notNull().default(0),
+  impressions: integer("impressions").notNull().default(0),
+  position: decimal("position", { precision: 6, scale: 2 }).notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().notNull(),
+}, (table) => [
+  // The upsert conflict target. Also serves every lookup prefixed by
+  // (blog_id) or (blog_id, date), which is why there is no separate
+  // blog_id/date index below — it would be redundant.
+  uniqueIndex("search_performance_unique_idx").on(table.blogId, table.date, table.rowHash),
+  index("search_performance_client_date_idx").on(table.clientId, table.date),
+  index("search_performance_date_idx").on(table.date),
+  index("search_performance_query_idx").on(table.query),
+]);
+
+// ─── index_coverage ──────────────────────────────────────────────────────────
+//
+// Latest Search Console URL-inspection verdict per published post. One row per
+// post, overwritten in place — this is a current-state table, not a log,
+// because URL Inspection is the scarcest quota we have (10,000 calls/day per
+// Cloud project) and history is not worth spending it on.
+//
+//   verdict:       PASS | PARTIAL | FAIL | NEUTRAL | VERDICT_UNSPECIFIED
+//   coverageState: the human string, e.g. "Submitted and indexed",
+//                  "Crawled - currently not indexed",
+//                  "Discovered - currently not indexed",
+//                  "URL is unknown to Google",
+//                  "Duplicate without user-selected canonical"
+//
+// googleCanonical vs userCanonical is the single most diagnostic pair in this
+// table: when they disagree, Google has folded the page into another URL,
+// which is exactly the "indexed but demoted" state the platform could not
+// previously see. Every column here comes back in the SAME response as
+// verdict, so storing them costs no extra quota. `raw` keeps the untouched
+// payload (same convention as client_keywords.raw / seo_scans.rawData) so
+// reprocessing never means re-spending an inspection.
+export const indexCoverage = pgTable("index_coverage", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  postId: uuid("post_id").notNull().references(() => generatedPosts.id, { onDelete: "cascade" }),
+  blogId: uuid("blog_id").notNull().references(() => blogs.id, { onDelete: "cascade" }),
+  clientId: uuid("client_id").notNull().references(() => clients.id, { onDelete: "cascade" }),
+  // The URL actually sent to Google, snapshotted — generated_posts.external_post_url
+  // can be rewritten later and we need to know what this verdict describes.
+  inspectedUrl: varchar("inspected_url", { length: 2048 }).notNull(),
+  verdict: varchar("verdict", { length: 32 }),
+  coverageState: varchar("coverage_state", { length: 160 }),
+  robotsTxtState: varchar("robots_txt_state", { length: 48 }),
+  indexingState: varchar("indexing_state", { length: 48 }),
+  pageFetchState: varchar("page_fetch_state", { length: 48 }),
+  googleCanonical: varchar("google_canonical", { length: 2048 }),
+  userCanonical: varchar("user_canonical", { length: 2048 }),
+  lastCrawlTime: timestamp("last_crawl_time"),
+  raw: jsonb("raw"),
+  lastCheckedAt: timestamp("last_checked_at").defaultNow().notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+}, (table) => [
+  uniqueIndex("index_coverage_post_idx").on(table.postId),
+  index("index_coverage_blog_verdict_idx").on(table.blogId, table.verdict),
+  index("index_coverage_checked_idx").on(table.lastCheckedAt),
+  index("index_coverage_client_idx").on(table.clientId),
 ]);

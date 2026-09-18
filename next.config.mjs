@@ -7,6 +7,14 @@ const nextConfig = {
     ignoreDuringBuilds: true,
   },
   experimental: {
+    // googleapis ships every Google API surface as one package. Bundling it
+    // into the server output balloons the build and trips Next's static
+    // analysis on its dynamic requires. It only ever runs in Node route
+    // handlers, so leave it external and let require() find it at runtime.
+    //
+    // Next 14 spelling. Next 15 renamed this to a top-level
+    // serverExternalPackages — using that spelling here silently does nothing.
+    serverComponentsExternalPackages: ["googleapis"],
     optimizePackageImports: [
       "lucide-react",
       "recharts",

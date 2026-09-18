@@ -41,6 +41,7 @@ import {
   getStyleProfileForBlog,
 } from "@/lib/actions/style-profile-actions";
 import { verticalForNiche } from "@/lib/content/verticals";
+import { provisionGscProperty } from "@/lib/services/gsc-verifier";
 
 /**
  * Load the blog's style profile, lazily assigning one if the blog is a
@@ -515,6 +516,35 @@ export async function createBlog(data: unknown) {
     } catch (profileErr) {
       console.error("Style profile assignment threw:", profileErr);
     }
+
+    // Search Console property provisioning (T04). FIRE-AND-FORGET, deliberately:
+    // the chain is getToken -> theme write -> verifyOwnership -> sites.add ->
+    // sitemaps.submit, five external round trips that would add 5-15s to a form
+    // submit. Same idiom as pingIndexNowFireAndForget and safe for the same
+    // reason — this runs on a long-lived Node server (`next start` on Render),
+    // not a function that freezes after the response.
+    //
+    // A WordPress blog comes back "pending_dns" with the TXT value stored on the
+    // row; the daily /api/cron/gsc-sync?verify=1 pass retries until the record is
+    // published, so nothing is lost if this attempt does not complete.
+    void (async () => {
+      try {
+        const [row] = await db.select().from(blogs).where(eq(blogs.id, inserted.id));
+        if (!row) return;
+        const gsc = await provisionGscProperty(row);
+        if (gsc.status === "pending_dns") {
+          console.info(
+            `[gsc-verify] ${row.domain} awaiting DNS TXT — publish at the apex: ${gsc.token ?? "(token not returned)"}`,
+          );
+        } else if (gsc.status === "failed") {
+          console.warn(
+            `[gsc-verify] provisioning failed for ${row.domain}: ${gsc.message ?? "unknown"}`,
+          );
+        }
+      } catch (gscErr) {
+        console.error("Search Console provisioning threw:", gscErr);
+      }
+    })();
 
     revalidatePath("/blogs");
     return { id: inserted.id };
