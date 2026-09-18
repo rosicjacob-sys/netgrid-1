@@ -60,7 +60,7 @@ the operator actions below are still required.
 
 ---
 
-## Status: 14 of 26 done, 12 remaining — **Phase 2 complete**
+## Status: 15 of 26 done, 11 remaining — **Phase 3 started**
 
 ### Done before this session
 
@@ -84,18 +84,23 @@ the operator actions below are still required.
 | **T14** | Yoast meta no-op | Every Yoast WordPress post published with the theme's default title and no meta description, while the log said "(SEO meta set)". Three independent reasons, all returning HTTP 200. Fixed: new `docs/wordpress/netgrid-seo-bridge.php` MU-plugin registers the real `_yoast_wpseo_*` keys for REST with an `auth_callback` and refreshes Yoast's indexable cache; `updateYoastMeta` writes those keys and throws when the bridge is absent; every write is now confirmed against the live `<head>` before anything is called a success. `metaStatus: "written"` now requires live verification. Per-post result persisted on `generated_posts`, bridge version per blog, and a measure-then-repair backfill. Migration `0047`. |
 | **T10** | Keyword pipeline at scale + ledger draining | The weekly refresh scraped every client in one unordered sequential pass (~5 h at 1,500 clients), so it never returned and the ledger rebuild after it never ran at all. Now 4-way sharded, hourly, staggered, with a staleness cursor on `clients.keywords_refresh_attempted_at` stamped *before* the scrape. `markKeywordTargetFailed` no longer buries a row in `failed` on the first transient error — bounded retries with a cool-off, dead-lettering only once the budget is spent, plus a two-window reaper that respects in-flight posts. Scrape locales now come from the client's own blogs instead of guessing from `language_mode`. A blocked scrape is reported instead of looking like "no results". The DataForSEO provenance downgrade is fixed. Migration `0046`, which also releases the existing permanent graves. |
 | **T18** | Post-verification at scale | The sweep was a single unordered sequential loop over every active blog under `curl --max-time 660 --retry 3` — it never finished, and curl retried it three more times while the abandoned handler kept running. Now 4-way sharded (same hash partition as auto-publish, pinned by golden-value tests), concurrency-capped, wall-clock budgeted, ordered least-recently-verified-first so nothing starves, with batched writes, a persisted run summary in `activity_log`, coverage/silence alerts, and a retention prune. `posts_in_period` is a real 7-day count for the first time. The sweep no longer stamps `blogs.lastPostVerifiedAt` — that column is the auto-publish priority key. `vercel.json` deleted (two of its five schedules 404'd, two exactly duplicated Render). Migration `0045`. |
+| **T13** | Composer repair | Every non-peptide blog in the network was writing from **one** template. `buildStructuralPool` filtered on `subNicheFit` at all three tiers, and no template declares a sub-niche above 13 — so the pool came back `[]` for sub-niches 14-90 and `pickTemplateForPost` silently served `TEMPLATES[1]`, peptide section labels ("Mechanism — how the compound works at cellular level") included, on every roofing, loans and casino post ever published. Separately `archetypeForVoice` scanned only the `voiceRange` bands, which stop at V77, so all 50 cross-niche voices collapsed onto archetype 1 and 5 of 12 skeletons were unreachable. Now: 22 niche-neutral flow variants (`CROSS_NICHE_FLOWS`), a 6-tier pool ladder with a sub-niche-agnostic floor, `archetypeForVoice` reading the voice's declared archetype, and the three dead compatibility guards (`SubNiche`, `Cadence`, `Strictness`) finally called. Two strings that were being ordered into published HTML are gone: the literal `(no compliance phrase required for this niche)` and the raw token `{citation.style}`. No migration — data repair only, via `src/lib/db/repair-structural-pools.ts`. |
 | **T17** | Cadence integrity | One canonical `blogs.posting_plan integer[7]` replaces four disagreeing columns. New pure module `src/lib/posting-plan.ts`; publisher, verifier, pipeline-alerts, validators, CSV importer, form, admin + portal UIs all read it. Publish window narrowed to 0–17h so no blog has a single tick of runway. `?dry=1` on the auto-publish route. "No posting plan" is now a critical notification and an `activity_log` row, not a discarded JSON string. Migration `0043`; `0044_drop_legacy_cadence.sql.pending` written but inert. |
 
-### Remaining: 12
+### Remaining: 11
 
 Grouped by the phase plan; ordering follows T00's dependency map.
 
-**Phase 3 — content & targeting (7)**
+**Phase 3 — content & targeting (6 of 7 left)**
 
-`T13` composer repair → `T09` winnability → `T11` ideation grounding → `T05`
-prompt rewrite → `T21` prompt contradictions; plus `T12` author entities →
-`T20` FAQ structured data. All untouched. **Order is load-bearing:** composer
-before prompts, difficulty before winnability before ideation.
+`T13` composer repair is **done**. Next: `T09` winnability → `T11` ideation
+grounding → `T05` prompt rewrite → `T21` prompt contradictions; plus `T12`
+author entities → `T20` FAQ structured data. **Order is load-bearing:**
+composer before prompts, difficulty before winnability before ideation.
+
+`T09` is **blocked** on a `DATAFORSEO_MONTHLY_BUDGET` figure — T10 Step 10 (the
+budgeted DataForSEO cron) was deliberately not built pending that sign-off, and
+T09's difficulty scoring depends on it.
 
 **Phase 4 — hygiene (5)**
 
@@ -132,6 +137,20 @@ reading it. Worth knowing about because the SOPs are otherwise reliable.
 ## Operator actions that are NOT code
 
 These block acceptance and nobody but a human can do them.
+
+- **T13 — run the structural-pool repair after this deploys, not before.**
+  `npx tsx src/lib/db/repair-structural-pools.ts --dry-run`, read the sample,
+  then run it without the flag. It rebuilds the empty `structural_pool` arrays
+  every non-peptide profile was written with, and re-picks any `skeleton_id`
+  the newly-live guards reject. It calls `buildStructuralPool` and
+  `pickSkeleton` directly, so **run against the old code it would rewrite
+  every row with the same empty arrays it exists to repair.** Idempotent, so
+  re-running is safe. If `src/lib/db/repair-compounds.ts` is also queued, run
+  that one first — different columns, neither reads the other's output. Snapshot
+  first if you want an undo path: `CREATE TABLE style_profiles_backup_t13 AS
+  SELECT blog_id, structural_pool, skeleton_id FROM style_profiles;`
+- **T13 — grep the logs for `[composer] empty structuralPool` for 24h after
+  the backfill.** Any hit is a profile the repair missed; re-run it.
 
 - **T03 — the removal sweep touches ~1,500 live client sites.** The code, the
   queue and the dry-run mode are built; *running* it is a deliberate trigger,
@@ -254,6 +273,43 @@ If you apply an SOP verbatim, **check the highest existing file first.**
 
 Flagged deliberately rather than quietly left.
 
+- **T13 found four peptide-vocabulary leaks the SOP did not list**, and its
+  own acceptance criteria could not pass without fixing them. The SOP treats
+  `templates.ts` as the only library carrying peptide-specific text. It is
+  not: three of five `citation-styles.ts` examples are peptide research
+  ("a 2020 paper published in Peptides", "the BPC-157 thread on r/Peptides"),
+  five `quirks.ts` prompt instructions reach for compounds, vials and mcg
+  doses (quirk 8 names BPC-157 and "pentadecapeptide" outright), and
+  `BLOCK_COMPLIANCE`'s prohibition list is peptide vocabulary — which reaches
+  **gambling and online_casino**, because those niches do carry compliance
+  phrases and so take the phrase-bearing block, not the SOP's phrase-free
+  one. All four are fixed the same way `CROSS_NICHE_FLOWS` fixes templates:
+  peptide sub-niches (1-13) keep the original string byte-for-byte, everything
+  else resolves a subject-neutral variant. `BLOCK_COMPLIANCE_NEUTRAL_SUBJECT`
+  keeps the phrase machinery identical and swaps only the prohibition list.
+  Quirk `detector` functions are deliberately **not** varied — they run over
+  generated prose in the scrubber, and loosening them is a separate decision.
+- **T13's peptide path is not byte-identical, contrary to the SOP's §7.3
+  claim** — and that is correct. A pinned differential across 4 peptide
+  sub-niches × 12 skeletons × 3 templates shows exactly two differences, both
+  intended fixes that happen to land on peptides too: `{citation.style}` now
+  substitutes instead of shipping the raw token to the model, and skeleton
+  12's compliance clause moved onto its own line. Nothing else moved — no flow
+  label, no compliance block, no quirk. Re-run that check before touching the
+  composer again; the harness is three files and a `git stash`.
+- **T13 changes the RNG draw order.** `pickCadence` now runs before
+  `pickSkeleton`, so for a given `blogId` seed `assignProfile` produces a
+  different profile than it did before this deploy. Persisted rows are
+  untouched and nothing recomputes them, but **`reassignProfile` is no longer
+  idempotent across the deploy** — an admin re-roll returns a different
+  profile than the same re-roll would have yesterday. Say so in the release
+  note.
+- **Peptide sub-niche 13 (Sleep / circadian, ~40 blogs) changes behaviour**,
+  which is the one peptide-side improvement to expect. It is listed in exactly
+  one template's `subNicheFit` (T17), so the old tier 3 returned a
+  **one-template pool** and every sleep/circadian blog wrote from T17 forever.
+  It now falls through to tier 4 and gets a proper 3-5 pool. No other peptide
+  sub-niche moves.
 - **`resolveShard` throws outside the telemetry wrapper** (T08). A bad shard
   param from a non-route caller won't get a `cron_runs` row. The route
   validates first and returns 400, so this is defence-in-depth only.

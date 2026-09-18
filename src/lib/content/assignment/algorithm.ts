@@ -29,6 +29,9 @@ import {
 import { PEPTIDE_COMPOUNDS, GLP1_COMPOUNDS, canonForSubNiche } from "../libraries/compounds";
 import {
   defaultStrictness,
+  isSkeletonCompatibleWithCadence,
+  isSkeletonCompatibleWithStrictness,
+  isSkeletonCompatibleWithSubNiche,
   isSkeletonCompatibleWithVoice,
   schemaBiasForVoice,
 } from "../libraries/compatibility";
@@ -40,6 +43,7 @@ import {
   TAG_SET_IDS,
 } from "../libraries/tag-sets";
 import {
+  CROSS_NICHE_TEMPLATE_IDS,
   SUB_NICHE_TAG_SET_OVERRIDES,
   TAG_SET_EXCLUDED_FOR_CADENCE,
   TEMPLATES,
@@ -222,15 +226,48 @@ function pickVoice(
 
 // ─── Phase 3: Skeleton ─────────────────────────────────────────────────────
 
-function pickSkeleton(
+/**
+ * Pick the blog's locked skeleton.
+ *
+ * Voice and sub-niche are HARD gates, applied at every tier. The sub-niche
+ * gate is what keeps skeleton 11 ("You will write a research-frame article
+ * about peptides") on the two peptide sub-niches it declares — 4 and 10.
+ * Before this change that declaration was inert:
+ * isSkeletonCompatibleWithSubNiche had no callers anywhere in the tree.
+ *
+ * Cadence and strictness are SOFT gates. Their tables are hand-tuned for the
+ * peptide era (skeleton 10 wants cadences 7/11/13; the extended cross-niche
+ * cadence pool is 15-24), so insisting on them can empty the set. They are
+ * dropped in order rather than allowed to force a fallback to S9.
+ *
+ * Exported so src/lib/db/repair-structural-pools.ts can re-pick skeletons for
+ * rows whose stored skeleton is now out of policy.
+ */
+export function pickSkeleton(
   rng: SeededRng,
   ns: NetworkState,
   voiceId: VoiceId,
+  subNiche: SubNicheId,
+  cadenceId: CadenceId,
+  strictness: ScrubberStrictness,
 ): SkeletonId {
-  const eligible = SKELETON_IDS.filter((id) =>
-    isSkeletonCompatibleWithVoice(id, voiceId),
+  const hard = SKELETON_IDS.filter(
+    (id) =>
+      isSkeletonCompatibleWithVoice(id, voiceId) &&
+      isSkeletonCompatibleWithSubNiche(id, subNiche),
   );
-  if (eligible.length === 0) {
+  const tiers: SkeletonId[][] = [
+    hard.filter(
+      (id) =>
+        isSkeletonCompatibleWithCadence(id, cadenceId) &&
+        isSkeletonCompatibleWithStrictness(id, strictness),
+    ),
+    hard.filter((id) => isSkeletonCompatibleWithCadence(id, cadenceId)),
+    hard.filter((id) => isSkeletonCompatibleWithStrictness(id, strictness)),
+    hard,
+  ];
+  const eligible = tiers.find((t) => t.length > 0);
+  if (!eligible) {
     // No compatible skeleton — fall back to S9 (the universal-fit skeleton).
     return 9;
   }
@@ -403,7 +440,28 @@ function pickQuirks(
 
 // ─── Phase 9: Structural pool ──────────────────────────────────────────────
 
-function buildStructuralPool(
+/**
+ * Build the blog's locked 3-5 template pool.
+ *
+ * Tier ladder, first tier yielding 3+ candidates wins:
+ *
+ *   1. archetype + sub-niche + tag-set        (peptide-era strict fit)
+ *   2. archetype + sub-niche
+ *   3. sub-niche only
+ *   4. cross-niche set + archetype + tag-set  (sub-niche-agnostic floor)
+ *   5. cross-niche set + archetype
+ *   6. cross-niche set
+ *
+ * Tiers 4-6 exist because EVERY template's subNicheFit list covers peptide
+ * sub-niches 1-13 only (max id across all 24 templates is 13). Non-peptide
+ * blogs draw sub-niches 14-90, so tiers 1-3 all return [] for them and the
+ * function used to return an empty pool — which made pickTemplateForPost
+ * silently serve TEMPLATES[1] for every post on every non-peptide blog.
+ *
+ * Exported so src/lib/db/repair-structural-pools.ts can rebuild the pools
+ * that were persisted empty.
+ */
+export function buildStructuralPool(
   rng: SeededRng,
   voiceId: VoiceId,
   subNiche: SubNicheId,
@@ -411,28 +469,39 @@ function buildStructuralPool(
 ): TemplateId[] {
   const archetype = archetypeForVoice(voiceId);
 
-  function isCompatible(t: StructuralTemplate): boolean {
-    if (t.voiceArchetypeFit.length > 0 && !t.voiceArchetypeFit.includes(archetype)) {
-      return false;
-    }
-    if (!t.subNicheFit.includes(subNiche)) return false;
-    if (!t.tagSetFit.includes(tagSetId)) return false;
-    return true;
-  }
+  const fitsArchetype = (t: StructuralTemplate): boolean =>
+    t.voiceArchetypeFit.length === 0 || t.voiceArchetypeFit.includes(archetype);
 
-  let candidates = TEMPLATE_IDS.filter((id) => isCompatible(TEMPLATES[id]));
-  if (candidates.length < 3) {
-    // Open up — drop tag-set filter
-    candidates = TEMPLATE_IDS.filter((id) => {
-      const t = TEMPLATES[id];
-      if (t.voiceArchetypeFit.length > 0 && !t.voiceArchetypeFit.includes(archetype)) return false;
-      if (!t.subNicheFit.includes(subNiche)) return false;
-      return true;
-    });
-  }
-  if (candidates.length < 3) {
-    // Last resort — just pick by sub-niche fit
-    candidates = TEMPLATE_IDS.filter((id) => TEMPLATES[id].subNicheFit.includes(subNiche));
+  const tiers: Array<() => TemplateId[]> = [
+    () =>
+      TEMPLATE_IDS.filter((id) => {
+        const t = TEMPLATES[id];
+        return (
+          fitsArchetype(t) &&
+          t.subNicheFit.includes(subNiche) &&
+          t.tagSetFit.includes(tagSetId)
+        );
+      }),
+    () =>
+      TEMPLATE_IDS.filter((id) => {
+        const t = TEMPLATES[id];
+        return fitsArchetype(t) && t.subNicheFit.includes(subNiche);
+      }),
+    () =>
+      TEMPLATE_IDS.filter((id) => TEMPLATES[id].subNicheFit.includes(subNiche)),
+    () =>
+      CROSS_NICHE_TEMPLATE_IDS.filter((id) => {
+        const t = TEMPLATES[id];
+        return fitsArchetype(t) && t.tagSetFit.includes(tagSetId);
+      }),
+    () => CROSS_NICHE_TEMPLATE_IDS.filter((id) => fitsArchetype(TEMPLATES[id])),
+    () => [...CROSS_NICHE_TEMPLATE_IDS],
+  ];
+
+  let candidates: TemplateId[] = [];
+  for (const tier of tiers) {
+    candidates = tier();
+    if (candidates.length >= 3) break;
   }
 
   // Split candidates into workhorse vs weird so we can enforce 1-2 weird
@@ -460,6 +529,19 @@ function buildStructuralPool(
       pool.push(remaining[idx]);
       remaining.splice(idx, 1);
     }
+  }
+
+  // Hard invariant: never hand the composer an empty pool. Unreachable given
+  // tier 6, but the cost of being wrong here is one template for a whole blog
+  // forever, so keep the belt.
+  if (pool.length === 0) {
+    pool.push(
+      ...pickN(
+        rng,
+        CROSS_NICHE_TEMPLATE_IDS,
+        Math.min(3, CROSS_NICHE_TEMPLATE_IDS.length),
+      ),
+    );
   }
 
   return pool.sort((a, b) => a - b);
@@ -786,10 +868,25 @@ export function assignProfile(
   // Phase 2
   const voiceId = pickVoice(rng, network, subNicheId, niche);
   const voice = VOICES[voiceId];
-  // Phase 3
-  const skeletonId = pickSkeleton(rng, network, voiceId);
-  // Phase 4
+  // Phase 2b (was Phase 12) — pure function of voice + sub-niche, consumes no
+  // RNG, so hoisting it here changes nothing about the draw sequence. It is
+  // needed twice now: as a skeleton gate below, and for the Phase 10 phrase
+  // pick (the phrase-16 strictness rule).
+  const scrubberStrictness = defaultStrictness(voiceId, subNicheId);
+  // Phase 3 (was Phase 4) — hoisted above the skeleton draw because
+  // isSkeletonCompatibleWithCadence needs a cadence to test against. This DOES
+  // consume RNG, so it changes the draw order.
   const cadenceId = pickCadence(rng, network, voice, subNicheId);
+  // Phase 4 (was Phase 3) — now gated on voice + sub-niche + cadence +
+  // strictness instead of voice alone.
+  const skeletonId = pickSkeleton(
+    rng,
+    network,
+    voiceId,
+    subNicheId,
+    cadenceId,
+    scrubberStrictness,
+  );
   // Phase 5
   const tagSetId = pickTagSet(rng, voiceId, subNicheId, cadenceId);
   // Phase 6
@@ -800,8 +897,6 @@ export function assignProfile(
   const quirks = pickQuirks(rng, network, voice);
   // Phase 9
   const structuralPool = buildStructuralPool(rng, voiceId, subNicheId, tagSetId);
-  // Phase 12 (strictness) — needed before Phase 10 phrase pick (phrase 16 rule)
-  const scrubberStrictness = defaultStrictness(voiceId, subNicheId);
   // Phase 10
   const compliancePhraseIds = pickCompliancePhrases(rng, network, scrubberStrictness, niche);
   const compliancePlacement = pickPlacement(rng, network, scrubberStrictness);
@@ -911,6 +1006,19 @@ function rerollRedundant(
   if (profile.cadenceId === other.cadenceId) {
     const voice = VOICES[profile.voiceId];
     next.cadenceId = pickCadence(rng, network, voice, profile.subNicheId);
+    // The skeleton was locked against the OLD cadence. If the new one is
+    // outside the skeleton's declared cadence affinity, re-pick the skeleton
+    // so the pairing stays inside policy.
+    if (!isSkeletonCompatibleWithCadence(next.skeletonId, next.cadenceId)) {
+      next.skeletonId = pickSkeleton(
+        rng,
+        network,
+        next.voiceId,
+        next.subNicheId,
+        next.cadenceId,
+        next.scrubberStrictness,
+      );
+    }
   }
 
   return next;

@@ -414,9 +414,10 @@ and habits ({quirks_rendered}) — do those.
 
 Structural shape: {template.flow}. Cite stuff using {citation.style_description}.
 
-Two musts: include one of {compliance.phrases_rendered} at {compliance.placement}, and
-keep it research-frame (not personal-use). And you know the AI-tell list
+Keep it research-frame (not personal-use). And you know the AI-tell list
 already — none of that.
+
+Also: include one of {compliance.phrases_rendered} at {compliance.placement}.
 
 [BLOCK_AI_TELLS]
 [BLOCK_OUTPUT_FORMAT]`,

@@ -246,7 +246,7 @@ export interface CadenceSpec {
 export interface CitationStyleSpec {
   id: CitationStyleId;
   name: string;
-  styleDescription: string; // for {citation.style}
+  styleDescription: string; // for {citation.style_description}
   example: string; // for {citation.example}
   /** If false, citations are not verified at scrubber Layer 3. */
   verifiable: boolean;

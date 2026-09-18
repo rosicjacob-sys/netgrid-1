@@ -1,4 +1,5 @@
 import type { Archetype, ArchetypeId } from "../types";
+import { VOICES } from "./voices";
 
 /**
  * 12 voice archetypes. Voice ranges partition the 77 voices into archetype
@@ -139,10 +140,27 @@ export function archetypeById(id: ArchetypeId): Archetype {
   return ARCHETYPES[id];
 }
 
+/**
+ * Resolve a voice's archetype.
+ *
+ * The voice's own `archetype` field is authoritative (types.ts; set as the
+ * second argument to the v() builder in voices.ts). The voiceRange scan below
+ * is a fallback for ids that carry no voice row — a stale
+ * style_profiles.voice_id, for instance.
+ *
+ * Before this fix the function scanned voiceRange only. The 12 ranges stop at
+ * V77, so all 50 cross-niche voices (V78-V127) silently resolved to A1, which
+ * collapsed every non-peptide blog onto the archetype-1 slice of the skeleton,
+ * template, tag-set and strictness tables.
+ */
 export function archetypeForVoice(voiceId: number): ArchetypeId {
+  const declared = VOICES[voiceId]?.archetype;
+  if (declared !== undefined && ARCHETYPES[declared] !== undefined) {
+    return declared;
+  }
   for (const a of Object.values(ARCHETYPES)) {
     if (voiceId >= a.voiceRange[0] && voiceId <= a.voiceRange[1]) return a.id;
   }
-  // Out-of-range — default to A1
+  // Unknown voice id — default to A1
   return 1;
 }

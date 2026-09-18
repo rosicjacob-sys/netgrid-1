@@ -149,8 +149,64 @@ Do NOT improvise alternative compliance language. Use ONLY the phrasings supplie
 export const BLOCK_COMPLIANCE_BRIEF = `COMPLIANCE: include one of the following phrases verbatim at {compliance.placement}:
 {compliance.phrases_rendered}`;
 
+/**
+ * Compliance frame for niches that supply NO compliance phrases — every niche
+ * in niches.ts except peptides, gambling and online_casino.
+ *
+ * BLOCK_COMPLIANCE cannot serve those blogs: it orders the model to reproduce
+ * {compliance.phrases_rendered} verbatim and forbids improvising an
+ * alternative. With no phrases to render, the composer used to substitute the
+ * literal string "(no compliance phrase required for this niche)" — so the
+ * model was being told to print that sentence, verbatim, in the article.
+ *
+ * This variant keeps the useful half (an editorial frame) and drops the phrase
+ * machinery entirely. It is also subject-neutral, where BLOCK_COMPLIANCE talks
+ * about peptides and approved medications.
+ */
+export const BLOCK_COMPLIANCE_NO_PHRASES = `EDITORIAL FRAME:
+Write as an informed observer describing what is known, not as an advisor telling the reader what to do. This article must NOT:
+- Present a personal recommendation as established fact
+- Promise the reader a specific outcome, saving, or result
+- Claim professional, medical, legal, or financial authority
+- Use first-person experiential language ("I tried this", "when we tested it")
+
+State findings, say where they come from, and let the reader draw the conclusion. Where a claim is contested or the evidence is thin, say so plainly.`;
+
+/** Short form of the above, for the minimalist skeleton (S4). */
+export const BLOCK_COMPLIANCE_BRIEF_NO_PHRASES = `EDITORIAL FRAME: describe what is known and where it comes from. No personal recommendations, no promised outcomes, no first-person experience claims.`;
+
+/**
+ * Compliance frame for niches that DO supply compliance phrases but are not
+ * about peptides — gambling and online_casino.
+ *
+ * BLOCK_COMPLIANCE's prohibition list is peptide vocabulary ("Recommend
+ * personal use of any compound", "Compare peptides to approved medications",
+ * "Suggest specific doses for human consumption"). Those lines shipped to
+ * every casino and gambling blog, which is both nonsensical and a visible
+ * generation tell. The phrase machinery below is IDENTICAL to
+ * BLOCK_COMPLIANCE's — these niches genuinely need their required phrases
+ * rendered — only the prohibition list is subject-neutral.
+ */
+export const BLOCK_COMPLIANCE_NEUTRAL_SUBJECT = `COMPLIANCE — informational frame:
+This article must remain in an informational frame at all times. It must NOT:
+- Present a personal recommendation as established fact
+- Promise the reader a specific outcome, saving, or result
+- Claim professional, medical, legal, or financial authority
+- Make guarantees, implied or direct, about results the reader can expect
+- Use first-person experiential language ("I tried this", "after my last run", "when we tested it")
+
+REQUIRED COMPLIANCE LANGUAGE:
+Include at least one of the following phrases verbatim, placed at {compliance.placement}:
+{compliance.phrases_rendered}
+
+Do NOT improvise alternative compliance language. Use ONLY the phrasings supplied above.`;
+
+/** Short form of the above, for the minimalist skeleton (S4). */
+export const BLOCK_COMPLIANCE_BRIEF_NEUTRAL_SUBJECT = `COMPLIANCE: include one of the following phrases verbatim at {compliance.placement}:
+{compliance.phrases_rendered}`;
+
 export const BLOCK_CITATIONS = `CITATIONS:
-Use citation style: {citation.style}
+Use citation style: {citation.style_description}
 Example of how a citation should appear inline: {citation.example}
 
 If unsure of a citation's accuracy, OMIT it rather than fabricate. The scrubber will verify URLs and author/year/journal references; fabricated citations cause the article to fail and be regenerated.`;
