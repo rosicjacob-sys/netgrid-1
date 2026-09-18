@@ -114,8 +114,12 @@ services:
         sync: false
       # Semantic linking (cosine-similarity related posts). OPENAI_API_KEY
       # powers the text-embedding-3-small vectors; SHOPIFY_WEBHOOK_SECRET
-      # verifies articles/create|update webhooks. Threshold/max are optional
-      # (defaults 0.75 / 5).
+      # verifies articles/create|update webhooks. Every SEMANTIC_LINK_* knob is
+      # optional and read by the Next.js process, so they belong HERE, on the
+      # web service — a cron service's env vars are consumed by curl in the
+      # cron container and never reach the handler.
+      # Defaults: THRESHOLD 0.55 (on the blended hybrid scale, NOT a pure
+      # cosine cutoff), MAX 5, ALPHA 0.3.
       - key: OPENAI_API_KEY
         sync: false
       - key: SHOPIFY_WEBHOOK_SECRET
@@ -126,6 +130,22 @@ services:
         sync: false
       # Hybrid dense+sparse blend weight (sparse share). Default 0.3.
       - key: SEMANTIC_LINK_ALPHA
+        sync: false
+      # ── Internal linking (T16) ────────────────────────────────────────
+      # Kill switch for the publish-time relink hook, which now fires on the
+      # auto-publish cron as well as the two manual paths. "0" disables all
+      # three without a deploy and leaves the backfill cron as the only writer.
+      - key: SEMANTIC_LINK_ON_PUBLISH
+        sync: false
+      # Share of a backfill run's budget reserved for RE-linking posts whose
+      # neighbourhood has changed since they were last linked. Default 0.6.
+      # The rest goes to never-linked posts; unused NEW budget rolls into
+      # REFRESH, so the run never idles once history has drained.
+      - key: SEMANTIC_LINK_REFRESH_SHARE
+        sync: false
+      # Max posts taken from any ONE blog per refresh lane, so a 900-post blog
+      # cannot monopolise a batch. Default 3.
+      - key: SEMANTIC_LINK_REFRESH_PER_BLOG
         sync: false
       # Embedding backend: "openai" (default) or "local" (not yet implemented).
       - key: EMBEDDING_MODE
@@ -633,18 +653,25 @@ services:
         value: "660"
 
   # Semantic linking backfill: embed published posts missing a vector, then
-  # inject "Related posts" links into posts not yet linked. New posts are
-  # linked immediately on publish; this drains history in capped batches.
-  # Hourly at :20 so it doesn't collide with the on-the-hour publish crons.
+  # link them in two lanes — never-linked posts, and already-linked posts whose
+  # blog has published something newer (see runSemanticLinkingBackfill).
+  #
+  # New posts are linked immediately on publish now that the hook fires on the
+  # cron path too (T16), so the NEW lane mostly catches hook failures. The
+  # REFRESH lane is what keeps the graph bidirectional over time.
+  #
+  # Every 20 minutes at limit=150: ~214 publishes/day need a first link, and
+  # the rest of the budget goes to refreshing. At :05/:25/:45 it avoids the
+  # on-the-hour publish crons and the :07-:52 keyword shards.
   - type: cron
     name: netgrid-cron-semantic-linking
     runtime: docker
-    schedule: "20 * * * *"
+    schedule: "5,25,45 * * * *"
     dockerfilePath: ./cron/Dockerfile
     dockerContext: ./cron
     envVars:
       - key: CRON_PATH
-        value: /api/cron/semantic-linking?limit=40
+        value: /api/cron/semantic-linking?limit=150
       - key: APP_URL
         value: https://netgrid-16f6.onrender.com
       - key: CRON_SECRET

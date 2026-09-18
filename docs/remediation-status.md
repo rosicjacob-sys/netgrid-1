@@ -44,6 +44,7 @@ absent), so PR #137 does not run them either.
 | The T17 CSV cadence parser executed against its 11 test cases | All pass, same shim. |
 | The T18 cadence + sharding helpers executed against their 23 test cases | All pass, same shim. Includes golden shard values proving the extraction out of `content-generation-actions.ts` moved no blog between shards. |
 | The T10 ccTLD mapping executed against its 4 test cases | All pass, same shim. |
+| The T16 canonical-URL rewriter executed against its 6 test cases | All pass, same shim. One of them caught a real pre-existing bug — see below. |
 | The T14 head parser + match rules executed against their 14 test cases | All pass, under the shim with a scope-aware cheerio stand-in (not a real HTML parser). |
 | `docs/wordpress/netgrid-seo-bridge.php` linted with `php -l` | Pass — the one thing in this branch checked by a real compiler. |
 
@@ -66,7 +67,7 @@ T03 §8, T04 §8 and T08 §8. **Do not deploy on the strength of this document.*
 
 ---
 
-## Status: 12 of 26 done, 14 remaining
+## Status: 13 of 26 done, 13 remaining
 
 ### Done before this session
 
@@ -85,6 +86,7 @@ T03 §8, T04 §8 and T08 §8. **Do not deploy on the strength of this document.*
 | **T08** | Publish idempotency | `publish_day` + `day_slot` with a partial unique index; `cron/invoke.sh` retry/timeout fix; strict shard validation (400, not silent default); `reapStuckPublishes()`; `transient` on the result type so the worker-pool retry is reachable. Migration `0040`. |
 | **T03** | Link exchange shutdown | Engine hard-retired behind `LINK_EXCHANGE_RETIRED`; route returns 410 and imports nothing from the service; admin toggle refuses to re-enable; new `link-exchange-removal.ts` stripper + queue + cron. Migration `0041`. |
 | **T04** | Search Console feedback loop | `gsc-client.ts`, `gsc-verifier.ts`, `gsc-sync.ts`, `gsc-index-coverage.ts`, two cron routes, `search_performance` + `index_coverage` tables, 7 Render cron services. Migration `0042`. |
+| **T16** | Internal linking wiring | The relink hook had two call sites, both in the manual admin UI — it never fired for the auto-publish cron, which is the dominant publish path. So a cron-published post waited for the hourly backfill and its older siblings never linked forward at all. Now called from `runGenerateAndPublish`, behind a `SEMANTIC_LINK_ON_PUBLISH` kill switch that covers all three paths. Also: inline link candidates are chosen topically instead of by recency (same hybrid formula as the Related-posts engine), the full-text dictionary follows the post's language instead of always `english`, related posts are restricted to the same language, every link target is canonicalised, and the backfill budget is split into a new lane and a stale-refresh lane. Migration `0048`. |
 | **T14** | Yoast meta no-op | Every Yoast WordPress post published with the theme's default title and no meta description, while the log said "(SEO meta set)". Three independent reasons, all returning HTTP 200. Fixed: new `docs/wordpress/netgrid-seo-bridge.php` MU-plugin registers the real `_yoast_wpseo_*` keys for REST with an `auth_callback` and refreshes Yoast's indexable cache; `updateYoastMeta` writes those keys and throws when the bridge is absent; every write is now confirmed against the live `<head>` before anything is called a success. `metaStatus: "written"` now requires live verification. Per-post result persisted on `generated_posts`, bridge version per blog, and a measure-then-repair backfill. Migration `0047`. |
 | **T10** | Keyword pipeline at scale + ledger draining | The weekly refresh scraped every client in one unordered sequential pass (~5 h at 1,500 clients), so it never returned and the ledger rebuild after it never ran at all. Now 4-way sharded, hourly, staggered, with a staleness cursor on `clients.keywords_refresh_attempted_at` stamped *before* the scrape. `markKeywordTargetFailed` no longer buries a row in `failed` on the first transient error — bounded retries with a cool-off, dead-lettering only once the budget is spent, plus a two-window reaper that respects in-flight posts. Scrape locales now come from the client's own blogs instead of guessing from `language_mode`. A blocked scrape is reported instead of looking like "no results". The DataForSEO provenance downgrade is fixed. Migration `0046`, which also releases the existing permanent graves. |
 | **T18** | Post-verification at scale | The sweep was a single unordered sequential loop over every active blog under `curl --max-time 660 --retry 3` — it never finished, and curl retried it three more times while the abandoned handler kept running. Now 4-way sharded (same hash partition as auto-publish, pinned by golden-value tests), concurrency-capped, wall-clock budgeted, ordered least-recently-verified-first so nothing starves, with batched writes, a persisted run summary in `activity_log`, coverage/silence alerts, and a retention prune. `posts_in_period` is a real 7-day count for the first time. The sweep no longer stamps `blogs.lastPostVerifiedAt` — that column is the auto-publish priority key. `vercel.json` deleted (two of its five schedules 404'd, two exactly duplicated Render). Migration `0045`. |
@@ -94,12 +96,11 @@ T03 §8, T04 §8 and T08 §8. **Do not deploy on the strength of this document.*
 
 Grouped by the phase plan; ordering follows T00's dependency map.
 
-**Phase 2 — pipeline integrity (2)**
+**Phase 2 — pipeline integrity (1)**
 
 | | Task | Current state |
 |---|---|---|
 | **T15** | IndexNow + sitemaps | Still one shared `INDEXNOW_KEY` network-wide. Sitemap submission now exists via T04's `gsc-verifier`; the IndexNow half is open |
-| **T16** | Internal linking | `relinkAfterPublishFireAndForget` still only called from the manual path, never from auto-publish |
 
 **Phase 3 — content & targeting (7)**
 
@@ -239,6 +240,7 @@ The SOPs assume the next free migration is `0039`. It was not — `0039` is
 | `0045_post_verification_retention.sql` | T18 |
 | `0046_keyword_pipeline_scale.sql` | T10 |
 | `0047_yoast_meta_verification.sql` | T14 |
+| `0048_semantic_linking_refresh.sql` | T16 |
 | `0044_drop_legacy_cadence.sql.pending` | T17 follow-up — **inert**, the runner globs `*.sql` |
 
 If you apply an SOP verbatim, **check the highest existing file first.**
@@ -297,6 +299,21 @@ Flagged deliberately rather than quietly left.
   burns a live fetch plus a REST write, comes back `stillBroken`, and stays in
   the candidate set — so the next run does it all again. `requireBridge=0` is
   available for a deliberate dry-run measurement.
+- **T16 fixed a pre-existing bug in `toCanonicalUrl` rather than copying it
+  verbatim as the SOP instructed.** The `URL.host` setter parses its value as
+  `host[:port]` and *leaves the existing port* when the value carries none, so
+  a self-hosted WordPress URL like `http://1.2.3.4:8080/x` became
+  `https://example.com:8080/x` — still rejected by IndexNow, and a broken
+  internal link now that the linking engine uses the same helper. The unit test
+  is what caught it. `u.port = ""` is now set explicitly.
+- **T16's publish hook raises peak concurrency.** Up to 12 simultaneous
+  publishes (4 shards x concurrency 3), each now also spawning one embedding
+  call plus up to 6 serial platform writes — worst case ~72 in-flight platform
+  writes for a few seconds per tick, all against *different* stores and all
+  outside the request's await chain. Safe on Render (`next start` is a
+  long-running process, so floating promises complete). **If the network ever
+  moves to a serverless host this hook must become an awaited call or a queue**,
+  or the writes are silently truncated.
 - **T03's removal cron and queue table are temporary.** Delete
   `netgrid-cron-link-exchange-removal`, the route, the service file and
   `link_exchange_removals` once the queue drains and is signed off (T03 §7.7).

@@ -156,56 +156,13 @@ export async function pingIndexNow(
  */
 import type { blogs as blogsTable } from "@/lib/db/schema";
 import { ensureIndexNowKeyDeployed } from "@/lib/services/index-now-deployer";
+import { toCanonicalUrl } from "@/lib/services/canonical-url";
 import {
   recordPipelineError,
   bumpCounter,
   trackBackground,
 } from "@/lib/services/run-telemetry";
 type Blog = typeof blogsTable.$inferSelect;
-
-/**
- * Rewrite a platform-internal URL onto the blog's canonical (customer-
- * facing) domain. Required because:
- *
- *   - Shopify's Admin API returns URLs on `xyz.myshopify.com`. Bing's
- *     IndexNow rejects `.myshopify.com` URLs with a 422 ("not related to
- *     your site verified through keylocation") — it wants the merchant's
- *     custom domain.
- *   - Self-hosted WP often runs on an IP+port (`http://1.2.3.4:8080/...`).
- *     IndexNow refuses IPs outright — domains only.
- *
- * The blog row already stores the canonical domain (`blog.domain`). We
- * swap the host of the platform URL for it, force https://, and pass that
- * to IndexNow.
- *
- * If `canonicalDomain` looks broken (IP, port leftover, no TLD), the
- * original URL is returned unchanged so IndexNow surfaces a clearer error
- * than a silent host mismatch.
- */
-function toCanonicalUrl(platformUrl: string, canonicalDomain: string): string {
-  if (!canonicalDomain) return platformUrl;
-  const cleanDomain = canonicalDomain
-    .trim()
-    .replace(/^https?:\/\//i, "")
-    .replace(/\/.*$/, "")
-    .replace(/:\d+$/, "");
-  if (
-    !cleanDomain ||
-    /^[\d.]+$/.test(cleanDomain) ||
-    cleanDomain.includes(":") ||
-    !cleanDomain.includes(".")
-  ) {
-    return platformUrl;
-  }
-  try {
-    const u = new URL(platformUrl);
-    u.protocol = "https:";
-    u.host = cleanDomain;
-    return u.toString();
-  } catch {
-    return platformUrl;
-  }
-}
 
 export function pingIndexNowFireAndForget(
   blog: Blog,

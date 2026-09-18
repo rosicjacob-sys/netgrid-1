@@ -15,13 +15,14 @@
 
 import { db } from "@/lib/db";
 import { blogs, generatedPosts } from "@/lib/db/schema";
-import { and, eq, isNotNull, isNull, ne, sql } from "drizzle-orm";
+import { and, eq, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
 import * as platform from "@/lib/services/platform-client";
 import type { PlatformBlog } from "@/lib/services/platform-client";
 import {
   embeddingsConfigured,
   getEmbeddingProvider,
 } from "@/lib/services/embeddings-client";
+import { toCanonicalUrl } from "@/lib/services/canonical-url";
 
 // ─── Config (env-overridable) ────────────────────────────────────────────────
 
@@ -46,6 +47,49 @@ function alpha(): number {
 function maxLinks(): number {
   const v = Number(process.env.SEMANTIC_LINK_MAX);
   return Number.isFinite(v) && v >= 1 ? Math.min(Math.floor(v), 10) : 5;
+}
+
+/**
+ * Postgres text-search configuration for a post's language.
+ *
+ * The sparse half of the hybrid score is a tsvector/tsquery pair, and BOTH
+ * halves must be built with the same dictionary or stemming silently fails to
+ * match: under 'english', "traitements" and "traitement" are two unrelated
+ * lexemes and "les"/"des"/"pour" are indexed as content words instead of
+ * stopwords, so a French post's sparse score keys on French function words
+ * that appear in every French article on the blog.
+ *
+ * generated_posts.language is "en" | "fr" | NULL. NULL is legacy data written
+ * before that column existed — it falls back to English, which is what those
+ * rows were indexed with anyway.
+ */
+const TS_CONFIG_BY_LANGUAGE: Record<string, string> = {
+  en: "english",
+  fr: "french",
+};
+
+export function tsConfigForLanguage(
+  language: string | null | undefined,
+): string {
+  return (
+    TS_CONFIG_BY_LANGUAGE[(language ?? "").trim().toLowerCase()] ?? "english"
+  );
+}
+
+/**
+ * Share of a backfill run's budget reserved for RE-linking already-linked
+ * posts whose neighbourhood has changed. The rest goes to never-linked posts.
+ */
+function refreshShare(): number {
+  const v = Number(process.env.SEMANTIC_LINK_REFRESH_SHARE);
+  return Number.isFinite(v) && v >= 0 && v <= 1 ? v : 0.6;
+}
+
+/** Max posts taken from any ONE blog per refresh lane, so a 900-post blog
+ *  can't monopolise a batch and starve the other 1,499 sites. */
+function refreshPerBlogCap(): number {
+  const v = Number(process.env.SEMANTIC_LINK_REFRESH_PER_BLOG);
+  return Number.isFinite(v) && v >= 1 ? Math.floor(v) : 3;
 }
 
 /** Delay between posts in the backfill link loop, to be gentle on platform APIs. */
@@ -176,6 +220,7 @@ export async function embedPost(
       id: generatedPosts.id,
       title: generatedPosts.title,
       body: generatedPosts.body,
+      language: generatedPosts.language,
     })
     .from(generatedPosts)
     .where(eq(generatedPosts.id, postId))
@@ -204,8 +249,16 @@ export async function embedPost(
         embeddingModel: provider.model,
         embeddedAt: new Date(),
         // Sparse half of the hybrid score: full-text vector over the same
-        // sanitized text. Set here so dense + sparse always stay in sync.
-        searchTsv: sql`to_tsvector('english', ${text})`,
+        // sanitized text, in the post's OWN language. Set here so dense +
+        // sparse always stay in sync, and so a re-embed also repairs a tsvector
+        // that was built with the wrong dictionary.
+        //
+        // The ::regconfig cast is required: to_tsvector(regconfig, text) and
+        // to_tsvector(text) are different overloads, and a bound parameter
+        // arrives with unknown type, so Postgres would resolve the
+        // single-argument form and treat the config NAME as the document. The
+        // config name is still a bound value, never concatenated.
+        searchTsv: sql`to_tsvector(${tsConfigForLanguage(post.language)}::regconfig, ${text})`,
         updatedAt: new Date(),
       })
       .where(eq(generatedPosts.id, postId));
@@ -245,20 +298,27 @@ function buildQueryText(title: string | null, keywords: unknown): string {
  * by the hybrid threshold and truncated to maxLinks.
  */
 export async function findRelated(postId: string): Promise<RelatedPost[]> {
+  // Join blogs for the canonical (customer-facing) domain: external_post_url
+  // is the PLATFORM url, which on Shopify is xyz.myshopify.com — never the
+  // host we want to link to.
   const [post] = await db
     .select({
       blogId: generatedPosts.blogId,
       title: generatedPosts.title,
       keywords: generatedPosts.keywords,
+      language: generatedPosts.language,
+      canonicalDomain: blogs.domain,
     })
     .from(generatedPosts)
+    .innerJoin(blogs, eq(generatedPosts.blogId, blogs.id))
     .where(eq(generatedPosts.id, postId))
     .limit(1);
   if (!post) return [];
 
   const targetEmbedding = sql`(select ${generatedPosts.embedding} from ${generatedPosts} where ${generatedPosts.id} = ${postId})`;
   const queryText = buildQueryText(post.title, post.keywords);
-  const tsQuery = sql`websearch_to_tsquery('english', ${queryText})`;
+  const tsConfig = tsConfigForLanguage(post.language);
+  const tsQuery = sql`websearch_to_tsquery(${tsConfig}::regconfig, ${queryText})`;
 
   // Dense (0-1 cosine similarity) and raw sparse (ts_rank) per candidate.
   const dense = sql<number>`1 - (${generatedPosts.embedding} <=> ${targetEmbedding})`;
@@ -280,6 +340,16 @@ export async function findRelated(postId: string): Promise<RelatedPost[]> {
         eq(generatedPosts.status, "published"),
         isNotNull(generatedPosts.embedding),
         isNotNull(generatedPosts.externalPostUrl),
+        // Same-language siblings only. Bilingual clients alternate EN/FR on
+        // one blog, and a cross-language "related post" is bad UX and an
+        // unjustified crawl signal with no hreflang to back it. NULL-language
+        // rows are legacy data and stay eligible so old blogs keep a pool.
+        post.language
+          ? or(
+              isNull(generatedPosts.language),
+              eq(generatedPosts.language, post.language),
+            )
+          : undefined,
       ),
     );
 
@@ -306,9 +376,157 @@ export async function findRelated(postId: string): Promise<RelatedPost[]> {
     .map((r) => ({
       id: r.id,
       title: r.title as string,
-      url: r.url as string,
+      url: toCanonicalUrl(r.url as string, post.canonicalDomain),
       similarity: r.score,
     }));
+}
+
+export interface TopicalLinkRef {
+  title: string;
+  url: string;
+  /** Blended hybrid score, for logging/debugging. Not used by the prompt. */
+  score?: number;
+}
+
+/**
+ * Rank a blog's published posts by topical relevance to a DRAFT article that
+ * does not exist yet (no row, no body, no embedding). Used by the generator to
+ * choose which siblings Claude may weave in as inline anchors.
+ *
+ * Same hybrid formula as findRelated — alpha * sparseNorm + (1 - alpha) * dense
+ * — so the inline-anchor lane and the Related-posts lane agree on what
+ * "related" means. Differences from findRelated, all deliberate:
+ *
+ *   - The dense vector comes from embedding the draft's topic + keywords
+ *     rather than a stored row.
+ *   - Candidates without an embedding are NOT excluded; they simply score 0 on
+ *     the dense half and can still win on the sparse half. A blog mid-backfill
+ *     must not lose its inline links.
+ *   - No threshold. This is a best-of-N pick, and the prompt already tells
+ *     Claude to use only the ones that genuinely relate. A threshold here would
+ *     silently return zero refs on a young blog and regress inline linking to
+ *     nothing.
+ *   - `recentSlots` of the returned slots are reserved for the most recently
+ *     published posts, so brand-new pages keep accruing inbound internal links
+ *     (the one property the old recency-only implementation had).
+ *
+ * Never throws: any failure returns whatever it has, and the caller has its own
+ * fallback. All URLs are canonicalised.
+ */
+export async function findTopicalLinkRefs(opts: {
+  blogId: string;
+  canonicalDomain: string;
+  topic: string;
+  keywords?: string[];
+  language?: string | null;
+  /** Total refs to return. Default 8 — matches the generator's prompt cap. */
+  limit?: number;
+  /** How many of `limit` are reserved for the newest posts. Default 2. */
+  recentSlots?: number;
+  /** Exclude a post from its own candidate list (the regenerate path). */
+  excludePostId?: string;
+}): Promise<TopicalLinkRef[]> {
+  const limit = Math.max(1, opts.limit ?? 8);
+  const recentSlots = Math.min(Math.max(0, opts.recentSlots ?? 2), limit);
+  const queryText = buildQueryText(opts.topic, opts.keywords ?? []);
+  const tsConfig = tsConfigForLanguage(opts.language);
+
+  // Dense half: embed the draft's topic + keywords. One embedding call against
+  // a 25-35s publish. Degrade to lexical-only on failure.
+  let vectorLiteral: string | null = null;
+  if (embeddingsConfigured() && queryText) {
+    try {
+      const provider = getEmbeddingProvider();
+      const [vector] = await provider.embed([queryText]);
+      if (Array.isArray(vector) && vector.length > 0) {
+        vectorLiteral = `[${vector.join(",")}]`;
+      }
+    } catch (err) {
+      console.warn(
+        `[semantic-linking] draft embed failed for blog ${opts.blogId}: ` +
+          `${err instanceof Error ? err.message : "unknown"} — ranking lexically`,
+      );
+    }
+  }
+
+  // The ::vector cast is mandatory: pgvector's <=> is only defined for
+  // vector <=> vector, and without it the bound parameter is unknown/text, so
+  // Postgres raises "operator does not exist: vector <=> text" at runtime —
+  // which the caller's try/catch would swallow into a permanent silent
+  // fallback to lexical ranking.
+  const dense = vectorLiteral
+    ? sql<number>`coalesce(1 - (${generatedPosts.embedding} <=> ${vectorLiteral}::vector), 0)`
+    : sql<number>`0`;
+  const sparse = queryText
+    ? sql<number>`coalesce(ts_rank(${generatedPosts.searchTsv}, websearch_to_tsquery(${tsConfig}::regconfig, ${queryText})), 0)`
+    : sql<number>`0`;
+
+  const rows = await db
+    .select({
+      title: generatedPosts.title,
+      url: generatedPosts.externalPostUrl,
+      publishedAt: generatedPosts.publishedAt,
+      dense,
+      sparse,
+    })
+    .from(generatedPosts)
+    .where(
+      and(
+        eq(generatedPosts.blogId, opts.blogId),
+        eq(generatedPosts.status, "published"),
+        isNotNull(generatedPosts.externalPostUrl),
+        isNotNull(generatedPosts.title),
+        opts.excludePostId ? ne(generatedPosts.id, opts.excludePostId) : undefined,
+        opts.language
+          ? or(
+              isNull(generatedPosts.language),
+              eq(generatedPosts.language, opts.language),
+            )
+          : undefined,
+      ),
+    );
+
+  const maxSparse = rows.reduce((m, r) => Math.max(m, Number(r.sparse) || 0), 0);
+  const a = alpha();
+
+  const scored = rows.flatMap((r) => {
+    const title = r.title;
+    const url = r.url;
+    if (!title || !url) return [];
+    const s = maxSparse > 0 ? (Number(r.sparse) || 0) / maxSparse : 0;
+    return [
+      {
+        title,
+        url: toCanonicalUrl(url, opts.canonicalDomain),
+        publishedAt: r.publishedAt ? new Date(r.publishedAt).getTime() : 0,
+        score: a * s + (1 - a) * (Number(r.dense) || 0),
+      },
+    ];
+  });
+
+  if (scored.length === 0) return [];
+
+  // Topical slots first, then the reserved recency slots, then top up with the
+  // next-best topical matches if recency produced duplicates. Keyed by
+  // canonical URL so the same post can't occupy two slots.
+  const byScore = [...scored].sort((x, y) => y.score - x.score);
+  const chosen = new Map<string, (typeof scored)[number]>();
+  for (const r of byScore.slice(0, Math.max(0, limit - recentSlots))) {
+    chosen.set(r.url, r);
+  }
+  const byRecency = [...scored].sort((x, y) => y.publishedAt - x.publishedAt);
+  for (const r of byRecency) {
+    if (chosen.size >= limit) break;
+    if (!chosen.has(r.url)) chosen.set(r.url, r);
+  }
+  for (const r of byScore) {
+    if (chosen.size >= limit) break;
+    if (!chosen.has(r.url)) chosen.set(r.url, r);
+  }
+
+  return Array.from(chosen.values())
+    .sort((x, y) => y.score - x.score)
+    .map(({ title, url, score }) => ({ title, url, score }));
 }
 
 // ─── Applying links to the live post ─────────────────────────────────────────
@@ -467,8 +685,16 @@ export async function relinkGeneratedPost(
  * Fire-and-forget relink triggered after a post is published. Relinks the new
  * post AND its top related neighbours one level deep, so the new post appears
  * in their "Related posts" lists too. Bounded by maxLinks; safe to ignore.
+ *
+ * Called from EVERY publish path: the auto-publish cron, the manual publish
+ * and the in-place regenerate. Set SEMANTIC_LINK_ON_PUBLISH=0 to disable all
+ * three without a deploy.
  */
 export function relinkAfterPublishFireAndForget(postId: string): void {
+  // One switch for "stop writing to live posts on publish", covering the
+  // auto-publish cron, the manual publish and the in-place regenerate. The
+  // backfill cron then remains the only writer.
+  if (process.env.SEMANTIC_LINK_ON_PUBLISH === "0") return;
   void (async () => {
     try {
       const { ok, related } = await relinkGeneratedPost(postId);
@@ -497,7 +723,10 @@ export interface BackfillResult {
   embedFailed: number;
   /** Already-embedded posts whose sparse full-text vector was backfilled. */
   tsvBackfilled: number;
+  /** Posts linked for the FIRST time this run (relatedLinkedAt was null). */
   linked: number;
+  /** Already-linked posts RE-linked this run, so they pick up newer siblings. */
+  relinked: number;
   linkFailed: number;
   /** First few failure reasons (capped), so the cron response is diagnosable. */
   errors?: BackfillError[];
@@ -515,6 +744,75 @@ export interface BackfillResult {
 const MAX_REPORTED_ERRORS = 10;
 
 /**
+ * Pick the refresh lane's batch: already-linked posts whose neighbourhood has
+ * changed since they were last linked.
+ *
+ * "Stale" = the post's blog has published something (embedded, live) AFTER
+ * this post's related_linked_at. That is exactly the set whose Related-posts
+ * block is out of date.
+ *
+ * Fairness: row_number() partitions by blog so at most refreshPerBlogCap()
+ * posts come from any one blog per run. Without it, a single 900-post blog
+ * with a fresh publish would fill every slot for hours.
+ *
+ * `requireStale: false` drops the staleness predicate — that is the one-off
+ * "?refresh=1" full rescore after tuning alpha/threshold.
+ *
+ * Raw SQL because the per-blog fairness cap needs a window function.
+ */
+async function selectRefreshBatch(opts: {
+  limit: number;
+  blogId?: string;
+  requireStale: boolean;
+}): Promise<string[]> {
+  if (opts.limit <= 0) return [];
+  const blogIdParam = opts.blogId ?? null;
+
+  const staleFilter = opts.requireStale
+    ? sql`AND EXISTS (
+            SELECT 1
+            FROM "generated_posts" newer
+            WHERE newer."blog_id" = gp."blog_id"
+              AND newer."id" <> gp."id"
+              AND newer."status" = 'published'
+              AND newer."embedding" IS NOT NULL
+              AND newer."published_at" > gp."related_linked_at"
+          )`
+    : sql`AND TRUE`;
+
+  const result = await db.execute<{ id: string }>(sql`
+    SELECT ranked."id"
+    FROM (
+      SELECT gp."id",
+             gp."related_linked_at",
+             row_number() OVER (
+               PARTITION BY gp."blog_id"
+               ORDER BY gp."related_linked_at" ASC
+             ) AS rn
+      FROM "generated_posts" gp
+      WHERE gp."status" = 'published'
+        AND gp."embedding" IS NOT NULL
+        AND gp."external_post_id" IS NOT NULL
+        AND gp."related_linked_at" IS NOT NULL
+        AND (${blogIdParam}::uuid IS NULL OR gp."blog_id" = ${blogIdParam}::uuid)
+        ${staleFilter}
+    ) ranked
+    WHERE ranked."rn" <= ${refreshPerBlogCap()}
+    ORDER BY ranked."related_linked_at" ASC
+    LIMIT ${opts.limit}
+  `);
+
+  // Drizzle's neon-http driver returns { rows: [...] } here, not the array
+  // directly.
+  const rows = Array.isArray(result)
+    ? (result as unknown as Array<{ id: string }>)
+    : ((result as unknown as { rows?: Array<{ id: string }> }).rows ?? []);
+  return rows
+    .map((r) => r.id)
+    .filter((id): id is string => typeof id === "string");
+}
+
+/**
  * Cron entry point. Embeds published posts that don't yet have a vector, then
  * links published posts that haven't been linked yet. Both passes are capped
  * per run so a large catalogue drains over several runs instead of one giant
@@ -525,10 +823,11 @@ export async function runSemanticLinkingBackfill(options: {
   limit?: number;
   blogId?: string;
   /**
-   * Re-link posts that were already linked (oldest first), instead of only
-   * never-linked ones. Use for a one-off refresh after tuning alpha/threshold
-   * or after upgrading the scorer. Off by default so the scheduled cron only
-   * does new work.
+   * Re-link posts that were already linked (oldest first) and IGNORE the
+   * staleness filter — a full rescore after tuning alpha/threshold or
+   * upgrading the scorer. Off by default: scheduled runs use the split budget
+   * below, whose refresh lane only touches posts whose neighbourhood actually
+   * changed.
    */
   refresh?: boolean;
 } = {}): Promise<BackfillResult> {
@@ -538,6 +837,7 @@ export async function runSemanticLinkingBackfill(options: {
       embedFailed: 0,
       tsvBackfilled: 0,
       linked: 0,
+      relinked: 0,
       linkFailed: 0,
       skipped: "OPENAI_API_KEY not configured",
     };
@@ -558,6 +858,7 @@ export async function runSemanticLinkingBackfill(options: {
       id: generatedPosts.id,
       title: generatedPosts.title,
       body: generatedPosts.body,
+      language: generatedPosts.language,
     })
     .from(generatedPosts)
     .where(
@@ -578,7 +879,9 @@ export async function runSemanticLinkingBackfill(options: {
       if (!text) continue;
       await db
         .update(generatedPosts)
-        .set({ searchTsv: sql`to_tsvector('english', ${text})` })
+        .set({
+          searchTsv: sql`to_tsvector(${tsConfigForLanguage(row.language)}::regconfig, ${text})`,
+        })
         .where(eq(generatedPosts.id, row.id));
       tsvBackfilled++;
     } catch (err) {
@@ -611,40 +914,75 @@ export async function runSemanticLinkingBackfill(options: {
     }
   }
 
-  // 2. Link posts. Default: only never-linked ones. Refresh: re-link
-  //    already-linked posts too, oldest-linked first so runs make progress.
-  const toLink = await db
-    .select({ id: generatedPosts.id })
-    .from(generatedPosts)
-    .where(
-      and(
-        eq(generatedPosts.status, "published"),
-        isNotNull(generatedPosts.embedding),
-        isNotNull(generatedPosts.externalPostId),
-        options.refresh ? undefined : isNull(generatedPosts.relatedLinkedAt),
-        options.blogId ? eq(generatedPosts.blogId, options.blogId) : undefined,
-      ),
-    )
-    .orderBy(sql`${generatedPosts.relatedLinkedAt} asc nulls first`)
-    .limit(limit);
+  // 2. Link, in two lanes.
+  //
+  //    NEW lane     — never-linked posts, newest first. Since the publish hook
+  //                   now links posts inline on every publish path, this lane
+  //                   mostly catches hook failures and posts published while
+  //                   OPENAI_API_KEY was down.
+  //    REFRESH lane — already-linked posts whose blog has published something
+  //                   newer. This is what keeps the graph bidirectional over
+  //                   time: without it, post #1 links to nothing published
+  //                   after the day it was first linked.
+  //
+  //    Unused NEW budget rolls into REFRESH, so once the historical corpus has
+  //    drained the whole run does useful refresh work instead of idling.
+  const wantsFullRefresh = options.refresh === true;
+  const refreshBudget = wantsFullRefresh
+    ? limit
+    : Math.floor(limit * refreshShare());
+  const newBudget = limit - refreshBudget;
+
+  const newRows =
+    newBudget > 0
+      ? await db
+          .select({ id: generatedPosts.id })
+          .from(generatedPosts)
+          .where(
+            and(
+              eq(generatedPosts.status, "published"),
+              isNotNull(generatedPosts.embedding),
+              isNotNull(generatedPosts.externalPostId),
+              isNull(generatedPosts.relatedLinkedAt),
+              options.blogId ? eq(generatedPosts.blogId, options.blogId) : undefined,
+            ),
+          )
+          .orderBy(sql`${generatedPosts.publishedAt} desc nulls last`)
+          .limit(newBudget)
+      : [];
+
+  const refreshIds = await selectRefreshBatch({
+    limit: refreshBudget + (newBudget - newRows.length),
+    blogId: options.blogId,
+    requireStale: !wantsFullRefresh,
+  });
+
+  const newIds = new Set(newRows.map((r) => r.id));
+  // The two lanes cannot overlap in normal operation — one requires
+  // related_linked_at IS NULL, the other IS NOT NULL. The Set is
+  // belt-and-braces for the ?refresh=1 mode where newBudget is 0.
+  const toLink = Array.from(new Set([...newIds, ...refreshIds]));
 
   let linked = 0;
+  let relinked = 0;
   let linkFailed = 0;
   const themeErrors = new Set<string>();
-  for (const row of toLink) {
+  for (const id of toLink) {
     try {
-      const res = await applyRelatedLinks(row.id);
-      if (res.ok) linked++;
-      else {
+      const res = await applyRelatedLinks(id);
+      if (res.ok) {
+        if (newIds.has(id)) linked++;
+        else relinked++;
+      } else {
         linkFailed++;
-        record("link", row.id, res.reason ?? "unknown error");
+        record("link", id, res.reason ?? "unknown error");
       }
       if (res.themeWarning) themeErrors.add(res.themeWarning);
     } catch (err) {
       // A platform API throwing (e.g. axios 4xx) must not abort the whole
       // run — record it and move on to the next post.
       linkFailed++;
-      record("link", row.id, errDetail(err));
+      record("link", id, errDetail(err));
     }
     // Gentle throttle so a batch doesn't burst the platform's rate limit.
     await sleep(LINK_THROTTLE_MS);
@@ -654,12 +992,19 @@ export async function runSemanticLinkingBackfill(options: {
     for (const w of themeErrors) console.warn(`[semantic-linking] theme: ${w}`);
   }
 
+  console.info(
+    `[semantic-linking] run complete — embedded=${embedded} tsv=${tsvBackfilled} ` +
+      `linked=${linked} relinked=${relinked} failed=${linkFailed} ` +
+      `(budget ${newBudget}/${refreshBudget} of ${limit})`,
+  );
+
   return {
     embedded,
     embedFailed,
     tsvBackfilled,
     ...(themeErrors.size > 0 ? { themeErrors: Array.from(themeErrors) } : {}),
     linked,
+    relinked,
     linkFailed,
     ...(errors.length > 0 ? { errors } : {}),
   };

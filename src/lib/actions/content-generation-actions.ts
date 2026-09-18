@@ -51,6 +51,11 @@ import { getAppBaseUrl } from "@/lib/services/link-tracker";
 import { pingIndexNowFireAndForget } from "@/lib/services/index-now-pinger";
 import { scanPostAfterPublishFireAndForget } from "@/lib/services/post-seo-runner";
 import {
+  findTopicalLinkRefs,
+  relinkAfterPublishFireAndForget,
+} from "@/lib/services/semantic-linking";
+import { toCanonicalUrl } from "@/lib/services/canonical-url";
+import {
   logScrubberVerdict,
   shouldHoldForReview,
   scrubberSummary,
@@ -373,37 +378,82 @@ export async function getRecentTitles(
 }
 
 /**
- * Pull the most recent published sibling posts on the same blog whose
- * platform URL is known — used by the content generator to weave inline
- * <a href> internal links into the article body. Per the footprint audit,
- * internal linking is the single SEO signal we were leaving on the table.
+ * Pick the published sibling posts the generator may weave into the article
+ * body as inline <a href> anchors.
+ *
+ * Selection is TOPICAL, not chronological: findTopicalLinkRefs scores every
+ * published sibling with the same hybrid (dense cosine + sparse full-text)
+ * formula the Related-posts engine uses, reusing embeddings that already exist
+ * on those rows. Two of the eight slots stay reserved for the most recent
+ * posts so brand-new pages keep accruing inbound internal links.
+ *
+ * Recency-only ordering (the previous behaviour) produced a chronological
+ * chain instead of topical clusters, so no pillar structure could form.
+ *
+ * URLs are canonicalised: external_post_url is the PLATFORM url, which on
+ * Shopify is xyz.myshopify.com.
+ *
+ * Falls back to the old recency query if the topical path returns nothing or
+ * throws — a missing internal-link block is worse than a chronological one.
  */
 async function getInternalLinkRefs(
-  blogId: string,
-  limit = 8,
+  blog: typeof blogs.$inferSelect,
+  opts: {
+    topic: string;
+    keywords?: string[];
+    language?: string | null;
+    limit?: number;
+    /** Regenerate path: don't offer a post its own URL as a link target. */
+    excludePostId?: string;
+  },
 ): Promise<Array<{ title: string; url: string }>> {
+  const limit = opts.limit ?? 8;
+
+  try {
+    const refs = await findTopicalLinkRefs({
+      blogId: blog.id,
+      canonicalDomain: blog.domain,
+      topic: opts.topic,
+      keywords: opts.keywords ?? [],
+      language: opts.language ?? null,
+      limit,
+      recentSlots: 2,
+      excludePostId: opts.excludePostId,
+    });
+    if (refs.length > 0) {
+      return refs.map(({ title, url }) => ({ title, url }));
+    }
+  } catch (err) {
+    console.warn(
+      `[internal-links] topical selection failed for ${blog.domain}: ` +
+        `${err instanceof Error ? err.message : "unknown"} — using recency`,
+    );
+  }
+
   const rows = await db
     .select({
+      id: generatedPosts.id,
       title: generatedPosts.title,
       url: generatedPosts.externalPostUrl,
     })
     .from(generatedPosts)
     .where(
       and(
-        eq(generatedPosts.blogId, blogId),
+        eq(generatedPosts.blogId, blog.id),
         eq(generatedPosts.status, "published"),
         isNotNull(generatedPosts.externalPostUrl),
         isNotNull(generatedPosts.title),
+        opts.excludePostId ? ne(generatedPosts.id, opts.excludePostId) : undefined,
       ),
     )
     .orderBy(desc(generatedPosts.publishedAt))
     .limit(limit);
-  return rows
-    .filter(
-      (r): r is { title: string; url: string } =>
-        Boolean(r.title) && Boolean(r.url),
-    )
-    .map((r) => ({ title: r.title, url: r.url }));
+
+  return rows.flatMap((r) =>
+    r.title && r.url
+      ? [{ title: r.title, url: toCanonicalUrl(r.url, blog.domain) }]
+      : [],
+  );
 }
 
 // ─── Core: generate + publish for one blog ──────────────────────────────────
@@ -692,10 +742,15 @@ export async function runGenerateAndPublish(
     // 5. Generate content using the style profile loaded in step 2.
     //    Resolve vertical so the generator can pull recent news headlines
     //    as external-link sources for non-peptide posts.
-    //    Pre-fetch sibling posts on this blog so the generator can weave
-    //    internal links into the article (Stage 1 of the footprint audit
-    //    fixes — the single biggest SEO signal we were missing).
-    const internalLinkRefs = await getInternalLinkRefs(blog.id, 8);
+    //    Pre-fetch TOPICALLY-RELATED sibling posts on this blog so the
+    //    generator can weave internal links into the article. `let`, not
+    //    `const`: the topic-recovery loop below can swap the topic out, and the
+    //    link candidates have to follow it.
+    let internalLinkRefs = await getInternalLinkRefs(blog, {
+      topic,
+      keywords,
+      language: postLanguage,
+    });
     // Zero refs means the article will be generated with no internal-link
     // clause at all. Normal for a blog's first few posts; a persistent
     // fleet-wide rate means externalPostUrl is not being recorded, which
@@ -844,6 +899,15 @@ export async function runGenerateAndPublish(
         currentTopic = newIdea.topic;
         currentKeywords =
           newIdea.keywords.length > 0 ? newIdea.keywords : currentKeywords;
+        // The recovery attempt writes about something else, so the topical
+        // link candidates picked for the ABANDONED topic no longer apply.
+        // Costs one more embedding call on a path that is already re-running
+        // full article generation.
+        internalLinkRefs = await getInternalLinkRefs(blog, {
+          topic: currentTopic,
+          keywords: currentKeywords,
+          language: postLanguage,
+        });
         // Reflect the new topic on the pending row so the dashboard
         // shows what the recovery attempt is actually writing about.
         await db
@@ -1115,6 +1179,23 @@ export async function runGenerateAndPublish(
     // Fire-and-forget so it never delays or fails the auto-publish run.
     scanPostAfterPublishFireAndForget(generatedPostId);
 
+    // 7b. Semantic linking — embed this post, inject its "Related posts" block
+    //     (Shopify: the custom.netgrid_related_posts metafield; WordPress: an
+    //     idempotent in-body block), then refresh its top neighbours so the NEW
+    //     post appears in THEIR related lists too. That backward+forward pair
+    //     is what keeps the internal link graph bidirectional; without it a
+    //     cron-published post waited for the hourly backfill and its older
+    //     siblings never linked forward at all — and the cron IS the dominant
+    //     publish path, so lane B effectively never fired in production.
+    //
+    //     Must come after the row is stamped status='published' with its
+    //     external ids above: applyRelatedLinks bails with "Post is not live"
+    //     otherwise.
+    //
+    //     Fire-and-forget and internally try/caught; no-op when
+    //     OPENAI_API_KEY is unset or SEMANTIC_LINK_ON_PUBLISH=0.
+    relinkAfterPublishFireAndForget(generatedPostId);
+
     // Local keyword-targeted content: the ledger row is 'generated' only
     // when the LIVE post actually targeted the claimed keyword (attempt 1
     // with localTarget). A fallback recovery attempt published successfully
@@ -1221,7 +1302,14 @@ export async function regenerateAndUpdatePost(
   }
 
   const keywords = Array.isArray(post.keywords) ? (post.keywords as string[]) : [];
-  const internalLinkRefs = await getInternalLinkRefs(blog.id, 8);
+  // excludePostId: this post is published with a live URL (guard above), so
+  // without it the regenerated body could link to itself.
+  const internalLinkRefs = await getInternalLinkRefs(blog, {
+    topic: post.topic,
+    keywords,
+    language: (post.language as "en" | "fr" | null) ?? ctx.language,
+    excludePostId: post.id,
+  });
   await loadNicheProfiles(); // generated niche context for getNicheContext()
 
   const content = await generateContent({
