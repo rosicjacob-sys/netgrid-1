@@ -15,7 +15,7 @@ import {
   vector,
   customType,
 } from "drizzle-orm/pg-core";
-import { relations } from "drizzle-orm";
+import { relations, sql } from "drizzle-orm";
 
 // Postgres full-text search vector. We never read the raw value back through
 // Drizzle (queries use ts_rank / @@ on it and set it via to_tsvector(...)),
@@ -145,10 +145,25 @@ export const clients = pgTable("clients", {
   status: clientStatusEnum("status").default("onboarding"),
   // Opt-in to the cross-site ABC link-exchange network. Off by default.
   linkExchangeEnabled: boolean("link_exchange_enabled").default(false).notNull(),
+  // Keyword-refresh bookkeeping (see actions/keyword-actions.ts, T10,
+  // migration 0046).
+  //   refreshedAt        — last scrape that actually stored keywords.
+  //   refreshAttemptedAt — last attempt, success or not. This is the sharded
+  //                        cron's fairness cursor: candidates are ordered by
+  //                        it, oldest first, and it is stamped BEFORE the
+  //                        scrape so a crash cannot pin a client at the head
+  //                        of the queue forever.
+  //   refreshFailures    — consecutive empty/blocked scrapes; 0 after any
+  //                        success. Drives the activity_log escalation.
+  keywordsRefreshedAt: timestamp("keywords_refreshed_at"),
+  keywordsRefreshAttemptedAt: timestamp("keywords_refresh_attempted_at"),
+  keywordsRefreshFailures: integer("keywords_refresh_failures").notNull().default(0),
   createdAt: timestamp("created_at").defaultNow().notNull(),
   updatedAt: timestamp("updated_at").defaultNow().notNull(),
 }, (table) => [
   index("clients_status_idx").on(table.status),
+  // The refresh candidate query: stalest-first, nulls first.
+  index("clients_keywords_refresh_idx").on(table.keywordsRefreshAttemptedAt),
 ]);
 
 // ─── 3. blogs ────────────────────────────────────────────────────────────────
@@ -162,6 +177,11 @@ export const blogs = pgTable("blogs", {
   wpUsername: varchar("wp_username", { length: 255 }),
   wpAppPassword: varchar("wp_app_password", { length: 255 }),
   seoPlugin: seoPluginEnum("seo_plugin").default("none"),
+  // Version reported by the netgrid-seo-bridge MU-plugin's
+  // /wp-json/netgrid/v1/seo-bridge probe, refreshed on every connection test.
+  // NULL = not installed: Yoast's _yoast_wpseo_* meta is NOT REST-writable on
+  // this site, so meta writes there are discarded with a 200. See T14.
+  seoBridgeVersion: varchar("seo_bridge_version", { length: 20 }),
   shopifyStoreUrl: varchar("shopify_store_url", { length: 500 }),
   shopifyAdminApiToken: varchar("shopify_admin_api_token", { length: 500 }),
 
@@ -172,14 +192,21 @@ export const blogs = pgTable("blogs", {
   shopifyBlogHandle: varchar("shopify_blog_handle", { length: 255 }),
   shopifyGrantedScopes: text("shopify_granted_scopes"),
 
+  // CANONICAL CADENCE. integer[7]; entry i = posts to publish on ISO weekday
+  // i+1 (1 = Mon ... 7 = Sun), UTC. All-zeros = "not scheduled", which is an
+  // alertable condition (see /api/notifications), never a silent skip.
+  // The publisher and the verification cron both read THIS and nothing else.
+  // See src/lib/posting-plan.ts and migration 0043_posting_plan.sql.
+  postingPlan: integer("posting_plan")
+    .array()
+    .notNull()
+    .default(sql`'{0,0,0,0,0,0,0}'::integer[]`),
+  // -- LEGACY cadence columns. Superseded by postingPlan; retained only so a
+  //    code rollback still has data to read. Dropped by migration 0044.
+  //    Nothing may READ these any more.
   postingFrequency: varchar("posting_frequency", { length: 50 }),
   postingFrequencyDays: integer("posting_frequency_days").array(),
-  // Sub-day cadence. Daily quota (e.g. 2 = max 2 posts per UTC day). Takes
-  // precedence over postingFrequencyDays when set.
   postsPerDay: integer("posts_per_day"),
-  // Minimum hours between consecutive posts on this blog. e.g. with
-  // postsPerDay=2 and postingIntervalHours=6: post #1 at T+0, post #2 at T+6h,
-  // then wait for the next UTC day.
   postingIntervalHours: integer("posting_interval_hours"),
   lastPostVerifiedAt: timestamp("last_post_verified_at"),
   lastPostTitle: varchar("last_post_title", { length: 500 }),
@@ -206,12 +233,55 @@ export const blogs = pgTable("blogs", {
   // Null means "don't touch the shop's existing metafields."
   homepageMetaTitle: varchar("homepage_meta_title", { length: 70 }),
   homepageMetaDescription: varchar("homepage_meta_description", { length: 320 }),
+  // ── IndexNow (see docs/indexnow/README.md) ───────────────────────────
+  // Per-blog key. NEVER shared across the network: the key file is public at
+  // a guessable URL on this domain, so one key across N domains is a one-GET
+  // membership test for the whole network.
+  indexnowKey: varchar("indexnow_key", { length: 128 }),
+  // Absolute URL where THIS blog serves its key file. Normally
+  // https://{domain}/{indexnowKey}.txt — the spec scopes a key file to its
+  // own directory, so it has to be at the root for post URLs to be covered.
+  // Operator-overridable for sites fronted by an edge rule.
+  indexnowKeyLocation: varchar("indexnow_key_location", { length: 1000 }),
+  // Last time we fetched indexnowKeyLocation and got back HTTP 200,
+  // text/plain, body === key. Null means "never verified".
+  indexnowKeyVerifiedAt: timestamp("indexnow_key_verified_at"),
+  // ── Google Search Console sitemap submission ─────────────────────────
+  sitemapUrl: varchar("sitemap_url", { length: 1000 }),
+  sitemapSubmittedAt: timestamp("sitemap_submitted_at"),
+  sitemapSubmitError: text("sitemap_submit_error"),
+  // ── Google Search Console (T04) ──
+  // gscSiteUrl is the property identifier every Search Console call is made
+  // with. Two shapes, decided by the verification method:
+  //   "sc-domain:example.com"  Domain property   (DNS_TXT verified)
+  //   "https://example.com/"   URL-prefix property (META verified)
+  // Null until the property is verified AND registered via sites.add.
+  gscSiteUrl: varchar("gsc_site_url", { length: 255 }),
+  // "DNS_TXT" | "META". Chosen by platform — see gsc-verifier.methodForBlog.
+  gscVerificationMethod: varchar("gsc_verification_method", { length: 16 }),
+  // The token Google handed back. For DNS_TXT this IS the operator
+  // deliverable (the TXT value to publish at the apex); for META it is the
+  // full <meta> tag we wrote into the theme.
+  gscVerificationToken: text("gsc_verification_token"),
+  gscVerifiedAt: timestamp("gsc_verified_at"),
+  gscSitemapSubmittedAt: timestamp("gsc_sitemap_submitted_at"),
+  // Last successful searchanalytics pull. Drives the sync cron's ordering
+  // (NULLS FIRST = never-synced blogs jump the queue) and lets the alert
+  // distinguish "suppressed site" from "broken cron".
+  gscLastSyncedAt: timestamp("gsc_last_synced_at"),
+  // Stamped when the 16-month historical pull completed for this blog, so
+  // the backfill mode can be re-run to completion without redoing work.
+  gscBackfilledAt: timestamp("gsc_backfilled_at"),
   createdAt: timestamp("created_at").defaultNow().notNull(),
   updatedAt: timestamp("updated_at").defaultNow().notNull(),
 }, (table) => [
   uniqueIndex("blogs_domain_idx").on(table.domain),
   index("blogs_client_id_idx").on(table.clientId),
   index("blogs_status_idx").on(table.status),
+  // Partial index: the sync cron's candidate query is
+  //   status = 'active' AND gsc_verified_at IS NOT NULL
+  // over the whole table, every run, on every shard.
+  index("blogs_gsc_synced_idx").on(table.gscLastSyncedAt),
 ]);
 
 // ─── 4. seo_scans ───────────────────────────────────────────────────────────
@@ -366,6 +436,15 @@ export const generatedPosts = pgTable("generated_posts", {
   clientId: uuid("client_id").notNull().references(() => clients.id, { onDelete: "cascade" }),
   topic: varchar("topic", { length: 500 }).notNull(),
   keywords: jsonb("keywords"),
+  // The demand-validated candidate query this post was built to cover, copied
+  // verbatim from the ranked pool. Null on the ungrounded fallback path (a
+  // client with no scraped keywords yet) and on posts predating T11 — that
+  // null-rate IS the grounding-coverage metric.
+  primaryQuery: varchar("primary_query", { length: 255 }),
+  // 3-6 real sub-questions the article is required to answer, chosen by
+  // ideation from the same query pool. Persisted here as an audit trail;
+  // consumed by the article prompt (T05).
+  supportingQueries: jsonb("supporting_queries"),
   title: varchar("title", { length: 500 }),
   body: text("body"),
   excerpt: text("excerpt"),
@@ -415,8 +494,31 @@ export const generatedPosts = pgTable("generated_posts", {
   // and the Shopify custom.netgrid_related_posts metafield.
   relatedPosts: jsonb("related_posts"),
   relatedLinkedAt: timestamp("related_linked_at"),
+  // ── SEO meta verification (T14) ──
+  // WordPress returns 200 for meta writes it silently discards, so a 2xx is
+  // not proof. This is what the LIVE page rendered after the write:
+  //   true  - the live <head> matched what we wrote
+  //   false - the page was fetched and did NOT match
+  //   null  - never checked (Shopify, a draft, or the page was unreachable)
+  seoMetaVerified: boolean("seo_meta_verified"),
+  seoMetaVerifiedAt: timestamp("seo_meta_verified_at"),
   generatedAt: timestamp("generated_at"),
   publishedAt: timestamp("published_at"),
+  // ── Auto-publish idempotency (T08) ──
+  // publishDay is the UTC calendar day this row CLAIMS a publishing slot
+  // on, as 'YYYY-MM-DD' (Drizzle maps a Postgres `date` to a string — same
+  // convention as reports.periodStart). daySlot is which slot inside that
+  // day, 0-based: a blog configured "2x per day" legitimately claims slots
+  // 0 and 1 (see parsePostsPerDay / isBlogDueForPost).
+  //
+  // Written ONLY by the auto-publish path (runGenerateAndPublish with
+  // isAutoGenerated). Manual generation from the admin UI leaves both null,
+  // and NULLs never collide in a unique index, so an operator can always
+  // add an extra post by hand. Every pre-T08 row is null too, which is why
+  // the unique index below can be created against a history that already
+  // contains same-day duplicates.
+  publishDay: date("publish_day"),
+  daySlot: integer("day_slot"),
   createdAt: timestamp("created_at").defaultNow().notNull(),
   updatedAt: timestamp("updated_at").defaultNow().notNull(),
 }, (table) => [
@@ -424,6 +526,23 @@ export const generatedPosts = pgTable("generated_posts", {
   index("generated_posts_client_id_idx").on(table.clientId),
   index("generated_posts_status_idx").on(table.status),
   index("generated_posts_created_at_idx").on(table.createdAt),
+  index("generated_posts_seo_meta_verified_idx").on(
+    table.blogId,
+    table.seoMetaVerified,
+  ),
+  // THE idempotency guard. At most one row may occupy a given
+  // (blog, UTC day, slot) while it is in flight or live. A row that fails
+  // drops out of the predicate and frees its slot for a retry; 'generated'
+  // (written but the platform publish failed) is also outside the
+  // predicate, so a failed publish does not burn the day. This is what
+  // makes /api/cron/auto-publish safe to invoke twice.
+  uniqueIndex("generated_posts_blog_day_slot_uniq")
+    .on(table.blogId, table.publishDay, table.daySlot)
+    .where(sql`${table.status} in ('generating', 'publishing', 'published')`),
+  // Drives the stuck-row reaper (reapStuckPublishes).
+  index("generated_posts_inflight_idx")
+    .on(table.status, table.updatedAt)
+    .where(sql`${table.status} in ('generating', 'publishing')`),
 ]);
 
 // ─── style_profiles ─────────────────────────────────────────────────────────
@@ -903,6 +1022,20 @@ export const blogKeywordTargets = pgTable("blog_keyword_targets", {
     onDelete: "set null",
   }),
   failureReason: text("failure_reason"),
+  // Bounded retry lifecycle (T10, migration 0046).
+  //   attempts     — resolved failures INCLUDING reaper requeues. The row is
+  //                  dead-lettered to 'failed' once this reaches
+  //                  KEYWORD_TARGET_MAX_ATTEMPTS. Before T10, 'failed' was set
+  //                  on the FIRST failure while the claim query only ever
+  //                  selected 'pending' and nothing reset it — so one
+  //                  transient model error permanently deleted that keyword
+  //                  from that blog.
+  //   lastAttemptAt— diagnostics; not read by the claim query.
+  //   nextRetryAt  — cool-off gate. NULL = claimable now (never attempted, or
+  //                  terminal).
+  attempts: integer("attempts").notNull().default(0),
+  lastAttemptAt: timestamp("last_attempt_at"),
+  nextRetryAt: timestamp("next_retry_at"),
   createdAt: timestamp("created_at").defaultNow().notNull(),
   updatedAt: timestamp("updated_at").defaultNow().notNull(),
   generatedAt: timestamp("generated_at"),
@@ -910,6 +1043,64 @@ export const blogKeywordTargets = pgTable("blog_keyword_targets", {
   uniqueIndex("blog_keyword_targets_unique_idx").on(table.blogId, table.keyword, table.city),
   index("blog_keyword_targets_blog_status_priority_idx").on(table.blogId, table.status, table.priority),
   index("blog_keyword_targets_client_idx").on(table.clientId),
+  // The claim query is now (blog_id, status='pending', next_retry_at gate)
+  // ORDER BY attempts, priority — the index above no longer covers it.
+  index("blog_keyword_targets_claim_idx").on(
+    table.blogId,
+    table.status,
+    table.nextRetryAt,
+    table.attempts,
+    table.priority,
+  ),
+  // The reaper: status='generating' AND updated_at < cutoff, network-wide.
+  index("blog_keyword_targets_stranded_idx").on(table.status, table.updatedAt),
+]);
+
+// ─── blog_covered_queries ─────────────────────────────────────────────────────
+//
+// PERMANENT per-blog record of which search queries a blog has already
+// covered. This replaces the 24-title dedup window (getRecentTitles: 12 own +
+// 12 sibling titles) that ideation used to rely on — a window that made a
+// two-year-old blog forget everything older than about two weeks and re-cover
+// the same subjects indefinitely.
+//
+// One row = "this blog has published a post whose subject is this query".
+// query_norm is normalizeQueryKey(query) (see content/topic-similarity.ts) and
+// is the uniqueness key, so accent/case/hyphen/spacing variants of the same
+// query collapse to one row. Written by recordCoveredQuery() after a post is
+// published (auto-publish) or persisted (manual generate); read by
+// getIdeationCandidatesForBlog() to remove already-covered queries from the
+// candidate list BEFORE the model ever sees them.
+//
+// client_id is denormalised from the blog so sibling blogs of the same client
+// can be consulted cheaply (a query a sibling already covered is
+// deprioritised, not removed — see getIdeationCandidatesForBlog).
+export const blogCoveredQueries = pgTable("blog_covered_queries", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  blogId: uuid("blog_id")
+    .notNull()
+    .references(() => blogs.id, { onDelete: "cascade" }),
+  clientId: uuid("client_id")
+    .notNull()
+    .references(() => clients.id, { onDelete: "cascade" }),
+  // The query exactly as it appeared in the candidate list / ledger row.
+  query: varchar("query", { length: 255 }).notNull(),
+  // normalizeQueryKey(query) — the dedup key. Never write this by hand in SQL;
+  // always go through the TS helper so the runtime and any backfill agree.
+  queryNorm: varchar("query_norm", { length: 255 }).notNull(),
+  // The angle/title actually published for this query. Fed back into the
+  // similarity corpus so a future post can't re-word an old angle either.
+  topic: varchar("topic", { length: 500 }).notNull(),
+  generatedPostId: uuid("generated_post_id").references(() => generatedPosts.id, {
+    onDelete: "set null",
+  }),
+  // "ideation" | "ledger" | "backfill" — where the coverage came from.
+  source: varchar("source", { length: 16 }).notNull().default("ideation"),
+  coveredAt: timestamp("covered_at").defaultNow().notNull(),
+}, (table) => [
+  uniqueIndex("blog_covered_queries_blog_query_idx").on(table.blogId, table.queryNorm),
+  index("blog_covered_queries_client_query_idx").on(table.clientId, table.queryNorm),
+  index("blog_covered_queries_blog_covered_at_idx").on(table.blogId, table.coveredAt),
 ]);
 
 // ─── registration_leads ───────────────────────────────────────────────────────
@@ -1034,9 +1225,13 @@ export const appSettings = pgTable("app_settings", {
 // Not FK-constrained so the log survives post/blog deletion. Ids are stored
 // loosely (nullable) for the same reason.
 // ─── link_exchange_loops / link_exchange_edges ──────────────────────────────
-// Cross-site ABC linking. A loop is a directed cycle of topically related,
-// opt-in blogs (A→B→C→A); each edge is one directed link with its anchor and
-// placement record. See src/lib/services/link-exchange.ts.
+// RETIRED (T03). Read-only history of the link-exchange scheme. A "loop" row
+// was one client's FULL MESH (every site linking to every other site it owns —
+// NOT the ABC cycle the original comment described); each edge is one directed
+// link with its anchor and placement record.
+// Statuses now in use: "pending" (legacy), "placed", "failed",
+//   "disabled" (never placed, terminated by migration 0041),
+//   "removed"  (was live, stripped by the removal job).
 export const linkExchangeLoops = pgTable("link_exchange_loops", {
   id: uuid("id").defaultRandom().primaryKey(),
   // One loop per client — the client's full mesh of interlinked sites.
@@ -1075,6 +1270,38 @@ export const linkExchangeEdges = pgTable("link_exchange_edges", {
   index("link_exchange_edges_source_idx").on(table.sourceBlogId),
 ]);
 
+// ─── link_exchange_removals ─────────────────────────────────────────────────
+// Durable work queue for the T03 link-exchange teardown. One row per published
+// post that must be checked for a `data-nx-exch` link left behind by the
+// retired exchange. All progress lives here rather than in memory, so the
+// removal job is restartable, idempotent and observable in SQL.
+//
+//   priority 0 → a placed edge points at this post: it is known to carry a link
+//   priority 1 → swept in because its blog ever hosted an exchange link
+//   status     → "pending" | "clean" | "removed" | "failed"
+//
+// previous_body holds the exact live body as it was BEFORE the strip, so a
+// single post can be restored (see restoreRemovedPost). Null it out once the
+// drain has been signed off.
+export const linkExchangeRemovals = pgTable("link_exchange_removals", {
+  postId: uuid("post_id")
+    .primaryKey()
+    .references(() => generatedPosts.id, { onDelete: "cascade" }),
+  blogId: uuid("blog_id").notNull().references(() => blogs.id, { onDelete: "cascade" }),
+  priority: integer("priority").default(1).notNull(),
+  status: varchar("status", { length: 16 }).default("pending").notNull(),
+  linksRemoved: integer("links_removed").default(0).notNull(),
+  attempts: integer("attempts").default(0).notNull(),
+  lastError: text("last_error"),
+  previousBody: text("previous_body"),
+  checkedAt: timestamp("checked_at"),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().notNull(),
+}, (table) => [
+  index("link_exchange_removals_queue_idx").on(table.status, table.priority),
+  index("link_exchange_removals_blog_idx").on(table.blogId),
+]);
+
 export const linkEvents = pgTable("link_events", {
   id: uuid("id").defaultRandom().primaryKey(),
   postId: uuid("post_id"),
@@ -1089,4 +1316,135 @@ export const linkEvents = pgTable("link_events", {
   index("link_events_blog_idx").on(table.blogId, table.type),
   index("link_events_client_idx").on(table.clientId, table.type),
   index("link_events_created_idx").on(table.createdAt),
+]);
+
+// ─── search_performance ──────────────────────────────────────────────────────
+//
+// Google Search Console performance rows: one per (blog x date x query x page).
+// Pulled by /api/cron/gsc-sync from searchanalytics.query and UPSERTED, so
+// re-running a window is idempotent — which matters because Google keeps
+// revising the most recent ~3 days after first publishing them.
+//
+// `date` is a Search Console date: America/Los_Angeles, NOT UTC. See
+// gscToday() in gsc-sync.ts — asking for a UTC "today" returns an empty day
+// for eight hours out of every twenty-four.
+//
+// `position` is the average SERP position for that row, fractional exactly as
+// Google returns it (e.g. 13.47). Stored as numeric, not a float, so AVG()
+// across millions of rows is exact and comparable between runs. Drizzle
+// returns numeric as a string — see the insert in gsc-sync.upsertRows.
+//
+// `ctr` is deliberately absent: it is exactly clicks / impressions and storing
+// it would create a second source of truth for one division.
+//
+// `rowHash` = sha256(query || '\0' || page), computed AFTER truncation so the
+// hash always describes what is actually stored. It exists for one reason: a
+// btree index entry cannot exceed ~2,704 bytes, and (query, page) in UTF-8
+// can. A natural unique index on (blog_id, date, query, page) would work for
+// months and then abort an entire 500-row upsert batch the first time one long
+// URL arrives. Hashing makes the key a fixed 64 bytes. query and page are
+// still stored verbatim and are still queryable.
+export const searchPerformance = pgTable("search_performance", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  blogId: uuid("blog_id").notNull().references(() => blogs.id, { onDelete: "cascade" }),
+  clientId: uuid("client_id").notNull().references(() => clients.id, { onDelete: "cascade" }),
+  date: date("date", { mode: "string" }).notNull(),
+  query: varchar("query", { length: 500 }).notNull(),
+  page: varchar("page", { length: 2048 }).notNull(),
+  rowHash: varchar("row_hash", { length: 64 }).notNull(),
+  clicks: integer("clicks").notNull().default(0),
+  impressions: integer("impressions").notNull().default(0),
+  position: decimal("position", { precision: 6, scale: 2 }).notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().notNull(),
+}, (table) => [
+  // The upsert conflict target. Also serves every lookup prefixed by
+  // (blog_id) or (blog_id, date), which is why there is no separate
+  // blog_id/date index below — it would be redundant.
+  uniqueIndex("search_performance_unique_idx").on(table.blogId, table.date, table.rowHash),
+  index("search_performance_client_date_idx").on(table.clientId, table.date),
+  index("search_performance_date_idx").on(table.date),
+  index("search_performance_query_idx").on(table.query),
+]);
+
+// ─── index_coverage ──────────────────────────────────────────────────────────
+//
+// Latest Search Console URL-inspection verdict per published post. One row per
+// post, overwritten in place — this is a current-state table, not a log,
+// because URL Inspection is the scarcest quota we have (10,000 calls/day per
+// Cloud project) and history is not worth spending it on.
+//
+//   verdict:       PASS | PARTIAL | FAIL | NEUTRAL | VERDICT_UNSPECIFIED
+//   coverageState: the human string, e.g. "Submitted and indexed",
+//                  "Crawled - currently not indexed",
+//                  "Discovered - currently not indexed",
+//                  "URL is unknown to Google",
+//                  "Duplicate without user-selected canonical"
+//
+// googleCanonical vs userCanonical is the single most diagnostic pair in this
+// table: when they disagree, Google has folded the page into another URL,
+// which is exactly the "indexed but demoted" state the platform could not
+// previously see. Every column here comes back in the SAME response as
+// verdict, so storing them costs no extra quota. `raw` keeps the untouched
+// payload (same convention as client_keywords.raw / seo_scans.rawData) so
+// reprocessing never means re-spending an inspection.
+export const indexCoverage = pgTable("index_coverage", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  postId: uuid("post_id").notNull().references(() => generatedPosts.id, { onDelete: "cascade" }),
+  blogId: uuid("blog_id").notNull().references(() => blogs.id, { onDelete: "cascade" }),
+  clientId: uuid("client_id").notNull().references(() => clients.id, { onDelete: "cascade" }),
+  // The URL actually sent to Google, snapshotted — generated_posts.external_post_url
+  // can be rewritten later and we need to know what this verdict describes.
+  inspectedUrl: varchar("inspected_url", { length: 2048 }).notNull(),
+  verdict: varchar("verdict", { length: 32 }),
+  coverageState: varchar("coverage_state", { length: 160 }),
+  robotsTxtState: varchar("robots_txt_state", { length: 48 }),
+  indexingState: varchar("indexing_state", { length: 48 }),
+  pageFetchState: varchar("page_fetch_state", { length: 48 }),
+  googleCanonical: varchar("google_canonical", { length: 2048 }),
+  userCanonical: varchar("user_canonical", { length: 2048 }),
+  lastCrawlTime: timestamp("last_crawl_time"),
+  raw: jsonb("raw"),
+  lastCheckedAt: timestamp("last_checked_at").defaultNow().notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+}, (table) => [
+  uniqueIndex("index_coverage_post_idx").on(table.postId),
+  index("index_coverage_blog_verdict_idx").on(table.blogId, table.verdict),
+  index("index_coverage_checked_idx").on(table.lastCheckedAt),
+  index("index_coverage_client_idx").on(table.clientId),
+]);
+
+// ─── index_ping_events ───────────────────────────────────────────────────────
+// Append-only record of every attempt to tell a search engine about our
+// content. This exists because the previous implementation reported failure
+// with console.warn only, which made a 100% failure rate indistinguishable
+// from a 100% success rate from every operator surface.
+//
+//   channel "indexnow"        -> a POST to api.indexnow.org
+//   channel "indexnow_deploy" -> making/verifying the key file on the domain
+//   channel "gsc_sitemap"     -> a Search Console sitemaps.submit
+//
+//   outcome "ok"      -> the engine accepted it
+//   outcome "failed"  -> we tried and it was rejected / errored
+//   outcome "skipped" -> we deliberately did not try (unsupported platform,
+//                        kill switch, missing credentials). Not an alert.
+export const indexPingEvents = pgTable("index_ping_events", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  blogId: uuid("blog_id")
+    .notNull()
+    .references(() => blogs.id, { onDelete: "cascade" }),
+  postId: uuid("post_id").references(() => generatedPosts.id, {
+    onDelete: "set null",
+  }),
+  channel: varchar("channel", { length: 24 }).notNull(),
+  outcome: varchar("outcome", { length: 16 }).notNull(),
+  targetUrl: varchar("target_url", { length: 1000 }),
+  keyLocation: varchar("key_location", { length: 1000 }),
+  httpStatus: integer("http_status"),
+  error: text("error"),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+}, (table) => [
+  index("index_ping_events_blog_idx").on(table.blogId, table.channel),
+  index("index_ping_events_outcome_idx").on(table.outcome, table.createdAt),
+  index("index_ping_events_created_idx").on(table.createdAt),
 ]);

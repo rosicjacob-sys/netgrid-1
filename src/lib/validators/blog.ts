@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { MAX_POSTS_PER_DAY, MAX_POSTS_PER_WEEK } from "@/lib/posting-plan";
 
 const domainRegex =
   /^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$/;
@@ -70,37 +71,49 @@ const optionalCountryCode = z.preprocess(
     .optional(),
 );
 
-// Optional positive integer: handles "", undefined, NaN, strings, numbers
-const optionalNumber = z
-  .union([z.string(), z.number(), z.undefined(), z.null()])
-  .transform((v) => {
-    if (v === undefined || v === null || v === "") return undefined;
-    const n = typeof v === "number" ? v : Number(v);
-    return Number.isFinite(n) ? n : undefined;
-  })
-  .refine(
-    (v) => v === undefined || (Number.isInteger(v) && v > 0),
-    { message: "Must be a positive integer" },
-  );
-
-// Posting days: array of ISO weekdays (1=Mon … 7=Sun). Accepts empty/null/undefined.
-// Deduplicates and sorts ascending so the DB always sees a clean array.
+// Posting days: array of ISO weekdays (1=Mon … 7=Sun), deduplicated and
+// sorted ascending so the DB always sees a clean array.
+//
+// The three states are DISTINCT and must stay that way:
+//   undefined → field absent from the payload → leave the stored plan alone
+//   []        → operator explicitly cleared the schedule → write an empty plan
+//   [1,3,5]   → Mon/Wed/Fri
+//
+// An invalid weekday is an error, not something to drop silently — dropping
+// it is how a blog ends up with a schedule nobody chose.
 const postingDays = z
   .union([z.array(z.union([z.string(), z.number()])), z.undefined(), z.null()])
-  .transform((v) => {
-    if (!v || v.length === 0) return undefined;
-    const nums = v
-      .map((x: unknown) => (typeof x === "number" ? x : Number(x)))
-      .filter((n: number) => Number.isInteger(n) && n >= 1 && n <= 7);
-    if (nums.length === 0) return undefined;
-    const uniq = Array.from(new Set<number>(nums));
-    uniq.sort((a, b) => a - b);
-    return uniq;
+  // Validation happens BEFORE the transform, not inside it: a failed check
+  // short-circuits parsing, so the transform below only ever sees clean input.
+  .superRefine((v, ctx) => {
+    if (v === undefined || v === null) return;
+    for (const x of v) {
+      const n = typeof x === "number" ? x : Number(x);
+      if (!Number.isInteger(n) || n < 1 || n > 7) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `Invalid posting day "${String(x)}" — use 1 (Mon) through 7 (Sun)`,
+        });
+      }
+    }
   })
-  .refine(
-    (v) => v === undefined || v.every((n: number) => n >= 1 && n <= 7),
-    { message: "Days must be between 1 (Mon) and 7 (Sun)" },
-  );
+  .transform((v) => {
+    if (v === undefined) return undefined;
+    if (v === null) return [] as number[];
+    const nums = v.map((x) => (typeof x === "number" ? x : Number(x)));
+    return Array.from(new Set<number>(nums)).sort((a, b) => a - b);
+  });
+
+// Posts published on each selected day. Blank/absent means 1.
+const postsPerDayField = z
+  .union([z.string(), z.number(), z.undefined(), z.null()])
+  .transform((v) => {
+    if (v === undefined || v === null || v === "") return 1;
+    return typeof v === "number" ? v : Number(v);
+  })
+  .refine((v) => Number.isInteger(v) && v >= 1 && v <= MAX_POSTS_PER_DAY, {
+    message: `Posts per day must be a whole number between 1 and ${MAX_POSTS_PER_DAY}`,
+  });
 
 // ─── Create Schema ──────────────────────────────────────────────────────────
 
@@ -137,9 +150,12 @@ export const createBlogSchema = z
     shopifyClientId: optionalString,
     shopifyClientSecret: optionalString,
 
-    // Posting cadence — frequency is always "weekly" now; days picks Mon–Sun.
-    postingFrequency: optionalString,
-    postingFrequencyDays: postingDays,
+    // Posting cadence. These two fields are combined into the canonical
+    // blogs.posting_plan by buildPostingPlan() in blog-actions.ts. The
+    // legacy postingFrequency string is gone — it meant posts-per-DAY to
+    // the publisher and nothing at all to anybody else.
+    postingDays: postingDays,
+    postsPerDay: postsPerDayField,
 
     status: z
       .enum(["active", "paused", "setup", "decommissioned"])
@@ -163,6 +179,32 @@ export const createBlogSchema = z
     homepageMetaDescription: optionalStringMax(320, "Keep it under 320 characters"),
   })
   .superRefine((data, ctx) => {
+    // ── Cadence must be schedulable ──────────────────────────────────────
+    // Enforced for every status, not just "active": a draft with an
+    // impossible schedule becomes an unpublishable active blog the moment
+    // someone flips the status, and nothing re-validates on that flip.
+    const days = data.postingDays ?? [];
+    const perDay = data.postsPerDay ?? 1;
+    const weekly = days.length * perDay;
+    if (weekly > MAX_POSTS_PER_WEEK) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["postsPerDay"],
+        message: `That schedule is ${weekly} posts/week; the maximum is ${MAX_POSTS_PER_WEEK}`,
+      });
+    }
+    // An ACTIVE blog with no posting days can never publish. That silence
+    // is the defect this validation exists to prevent — refuse it at the
+    // door rather than discovering it in a cron JSON body months later.
+    if (data.status === "active" && days.length === 0) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["postingDays"],
+        message:
+          "Pick at least one posting day — an active blog with no posting days will never publish",
+      });
+    }
+
     // Only enforce credentials when activating the blog AND only for the
     // selected platform. The form clears opposite-platform fields before
     // submission, but this guards against direct API callers too.
@@ -241,8 +283,8 @@ export const updateBlogSchema = z.object({
   shopifyClientId: optionalString,
   shopifyClientSecret: optionalString,
 
-  postingFrequency: optionalString,
-  postingFrequencyDays: postingDays,
+  postingDays: postingDays,
+  postsPerDay: postsPerDayField,
   status: z.enum(["active", "paused", "setup", "decommissioned"]).optional(),
   notesInternal: optionalString,
 
@@ -253,11 +295,33 @@ export const updateBlogSchema = z.object({
 
   homepageMetaTitle: optionalStringMax(70, "Keep it under 70 characters"),
   homepageMetaDescription: optionalStringMax(320, "Keep it under 320 characters"),
+}).superRefine((data, ctx) => {
+  // Same cadence rules as createBlogSchema. postingDays === undefined here
+  // means "not submitted" — leave the stored plan alone and skip the check.
+  //
+  // NOTE: attaching .superRefine turns updateBlogSchema into a ZodEffects.
+  // safeParse still works (that is the only way it is used), but .partial(),
+  // .pick() and .extend() no longer exist on it.
+  if (data.postingDays === undefined) return;
+  const days = data.postingDays;
+  const perDay = data.postsPerDay ?? 1;
+  const weekly = days.length * perDay;
+  if (weekly > MAX_POSTS_PER_WEEK) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["postsPerDay"],
+      message: `That schedule is ${weekly} posts/week; the maximum is ${MAX_POSTS_PER_WEEK}`,
+    });
+  }
+  if (data.status === "active" && days.length === 0) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["postingDays"],
+      message:
+        "Pick at least one posting day — an active blog with no posting days will never publish",
+    });
+  }
 });
 
 export type CreateBlogInput = z.infer<typeof createBlogSchema>;
 export type UpdateBlogInput = z.infer<typeof updateBlogSchema>;
-
-// Silence "unused" lint warning for the optional-number helper — kept
-// for upcoming numeric fields (e.g. posting cap per day).
-void optionalNumber;

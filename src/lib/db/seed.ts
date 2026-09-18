@@ -12,6 +12,7 @@ import bcrypt from "bcryptjs";
 import { eq } from "drizzle-orm";
 import { db } from "./index";
 import { users, clients, blogs } from "./schema";
+import { buildPostingPlan } from "../posting-plan";
 
 const ADMIN_EMAIL = "admin@netgrid.app";
 const ADMIN_PASSWORD = "admin123";
@@ -168,8 +169,7 @@ async function seedBlogs(clientIds: Record<string, string>) {
       wpUrl: "https://acme-insights.com",
       seoPlugin: "yoast" as const,
       // ISO weekdays (1=Mon … 7=Sun) — "3x per week" → Mon, Wed, Fri
-      postingFrequency: "weekly",
-      postingFrequencyDays: [1, 3, 5],
+      postingPlan: buildPostingPlan([1, 3, 5]),
       status: "active" as const,
     },
     {
@@ -179,8 +179,7 @@ async function seedBlogs(clientIds: Record<string, string>) {
       wpUrl: "https://acme-devblog.io",
       seoPlugin: "rankmath" as const,
       // "Weekly" → once per week on Wednesday
-      postingFrequency: "weekly",
-      postingFrequencyDays: [3],
+      postingPlan: buildPostingPlan([3]),
       status: "active" as const,
     },
     {
@@ -189,8 +188,7 @@ async function seedBlogs(clientIds: Record<string, string>) {
       platform: "shopify" as const,
       shopifyStoreUrl: "brightstore.myshopify.com",
       // "2x per week" → Tue + Thu
-      postingFrequency: "weekly",
-      postingFrequencyDays: [2, 4],
+      postingPlan: buildPostingPlan([2, 4]),
       status: "active" as const,
     },
     {
@@ -200,8 +198,7 @@ async function seedBlogs(clientIds: Record<string, string>) {
       wpUrl: "https://vitality-wellness.co",
       seoPlugin: "yoast" as const,
       // "Weekly" → once per week on Tuesday
-      postingFrequency: "weekly",
-      postingFrequencyDays: [2],
+      postingPlan: buildPostingPlan([2]),
       status: "setup" as const,
     },
   ];

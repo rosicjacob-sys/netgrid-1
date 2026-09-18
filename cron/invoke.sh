@@ -12,11 +12,32 @@ case "$APP_URL" in
   *)                  URL="https://${APP_URL}${CRON_PATH}" ;;
 esac
 
-# Default per-cron timeout — overridable from the cron service's env so
-# slow paths (auto-publish at 600s maxDuration, monthly-reports at 300s)
-# can opt up without blanket-extending fast paths. Defaults to 660 to
-# match the longest-running route (auto-publish, 600s) plus headroom.
-MAX_TIME="${CRON_MAX_TIME:-660}"
+# Per-cron timeout, overridable from the cron service's env so slow paths
+# can opt up without blanket-extending fast paths.
+#
+# MAX_TIME MUST SIT ABOVE THE ROUTE'S maxDuration, NEVER BELOW IT (T08).
+# curl counts a --max-time expiry as a transient error and retries, but the
+# Next handler it abandoned keeps running server-side: the retry then
+# executes a SECOND copy of the same sweep. The old default of 660 sat only
+# 60s above auto-publish's 600s maxDuration while a full run measured
+# 425-595s, so the two distributions overlapped on ordinary days. Sizing
+# MAX_TIME comfortably above maxDuration means the server always finishes
+# (or returns an error) before curl gives up. Note --max-time is per
+# ATTEMPT, so with retries the container can live for a multiple of this.
+MAX_TIME="${CRON_MAX_TIME:-900}"
+
+# Retries. curl's transient set is "timeout, 408, 429, 5xx" — a refused
+# connection is NOT retried unless --retry-connrefused is given. The old
+# flags therefore retried exactly the cases where the server was still
+# working (its own timeout, or a 5xx from a function that hit its deadline)
+# and skipped the one case where a retry is free and correct (the web
+# service was mid-restart and refused the connection).
+#
+# Hourly non-idempotent crons should set CRON_RETRY=0: a missed tick is
+# picked up by the next one, and the runner's own deferred-queue logic is
+# designed for exactly that. A 400 is never retried at any setting, so a
+# mis-typed CRON_PATH fails the container immediately.
+RETRIES="${CRON_RETRY:-3}"
 
 # -f is deliberately NOT used any more: it suppresses the response body on any
 # HTTP status >= 400, which is exactly the body carrying {"error": "..."} from
@@ -27,7 +48,7 @@ MAX_TIME="${CRON_MAX_TIME:-660}"
 # writes (see src/lib/services/run-telemetry.ts) — this output is for a human
 # tailing the container during an incident.
 BODY_FILE=$(mktemp)
-STATUS=$(curl -sS --retry 3 --max-time "$MAX_TIME" \
+STATUS=$(curl -sS --retry "$RETRIES" --retry-connrefused --max-time "$MAX_TIME" \
   -H "Authorization: Bearer ${CRON_SECRET}" \
   -o "$BODY_FILE" -w '%{http_code}' \
   "$URL") || STATUS="000"

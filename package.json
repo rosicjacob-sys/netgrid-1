@@ -17,7 +17,9 @@
     "db:repair-compounds": "cross-env NODE_OPTIONS=--dns-result-order=ipv4first tsx src/lib/db/repair-compounds.ts",
     "db:verify-local-targeting": "cross-env NODE_OPTIONS=--dns-result-order=ipv4first tsx src/lib/db/verify-local-targeting.ts",
     "db:import-homepage-seo": "cross-env NODE_OPTIONS=--dns-result-order=ipv4first tsx src/lib/db/import-homepage-seo.ts",
-    "db:import-city-assignments": "cross-env NODE_OPTIONS=--dns-result-order=ipv4first tsx src/lib/db/import-city-assignments.ts"
+    "db:import-city-assignments": "cross-env NODE_OPTIONS=--dns-result-order=ipv4first tsx src/lib/db/import-city-assignments.ts",
+    "db:backfill-indexnow": "cross-env NODE_OPTIONS=--dns-result-order=ipv4first tsx src/lib/db/backfill-indexnow.ts",
+    "db:backfill-covered-queries": "cross-env NODE_OPTIONS=--dns-result-order=ipv4first tsx src/lib/db/backfill-covered-queries.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.88.0",
@@ -56,6 +58,7 @@
     "date-fns": "^4.1.0",
     "dompurify": "^3.3.3",
     "drizzle-orm": "^0.45.2",
+    "googleapis": "^144.0.0",
     "isomorphic-dompurify": "^3.12.0",
     "lucide-react": "0.460.0",
     "mammoth": "^1.12.0",

@@ -283,3 +283,41 @@ export function quirksConflict(a: QuirkId, b: QuirkId): boolean {
     (QUIRKS[b].conflictsWith?.includes(a) ?? false)
   );
 }
+
+// ── Cross-niche quirk instructions ─────────────────────────────────────────
+//
+// A handful of promptInstruction strings above are written in peptide subject
+// matter — quirk 8 names BPC-157 and "pentadecapeptide" outright, and several
+// others reach for vials, mcg doses and clinicians. Those strings substitute
+// into {quirks_rendered} on EVERY blog, so a roofing prompt was being told to
+// parenthesize compound names and quote doses in micrograms.
+//
+// Same treatment as CROSS_NICHE_FLOWS in templates.ts: peptide sub-niches keep
+// the original text byte-for-byte, everything else gets a subject-neutral
+// rewrite. A quirk with no entry here is already subject-agnostic.
+//
+// The `detector` functions are deliberately NOT varied — they run over
+// generated prose in the scrubber, and loosening them is a separate decision
+// from what the prompt asks for.
+const CROSS_NICHE_QUIRK_INSTRUCTIONS: Partial<Record<QuirkId, string>> = {
+  6: "End at least one paragraph with a concrete number or specific unit (%, days, dollars, n=).",
+  8: "When a term of art is first used in each major section, parenthesize a short plain-language gloss (e.g. ice damming (meltwater refreezing at the eaves)).",
+  14: "When discussing cost or commerce, reference specific dollar amounts ('$48 a unit', 'around $200 a month').",
+  17: "When quoting numbers from a source, use ranges with hedging ('something like 30-50%', 'in the neighbourhood of two hundred').",
+  23: "Open or close with a brief observational anecdote in research-frame ('A practitioner I spoke with mentioned …', 'A 2023 case write-up described …'). Never first-person use.",
+};
+
+/**
+ * The prompt instruction to render for this sub-niche. Peptide sub-niches
+ * (1-13) keep the original; everything else gets the neutral rewrite when one
+ * exists.
+ */
+export function quirkInstructionForSubNiche(
+  id: QuirkId,
+  subNiche: number,
+): string | undefined {
+  const quirk = QUIRKS[id];
+  if (!quirk) return undefined;
+  if (subNiche <= 13) return quirk.promptInstruction;
+  return CROSS_NICHE_QUIRK_INSTRUCTIONS[id] ?? quirk.promptInstruction;
+}

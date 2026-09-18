@@ -1,7 +1,12 @@
 "use server";
 
 import { db } from "@/lib/db";
-import { logScrubberVerdict } from "@/lib/content/scrubber";
+import {
+  logScrubberVerdict,
+  shouldHoldForReview,
+  scrubberSummary,
+  SCRUBBER_HOLD_PREFIX,
+} from "@/lib/content/scrubber";
 import { blogs, clients, generatedPosts, blogKeywordTargets } from "@/lib/db/schema";
 import { requireAdmin } from "@/lib/auth/helpers";
 import { createBlogSchema, updateBlogSchema } from "@/lib/validators/blog";
@@ -36,6 +41,7 @@ import {
   getStyleProfileForBlog,
 } from "@/lib/actions/style-profile-actions";
 import { verticalForNiche } from "@/lib/content/verticals";
+import { provisionGscProperty } from "@/lib/services/gsc-verifier";
 
 /**
  * Load the blog's style profile, lazily assigning one if the blog is a
@@ -71,6 +77,7 @@ import {
 } from "@/lib/services/platform-client";
 import * as wp from "@/lib/services/wp-client";
 import { pingIndexNowFireAndForget } from "@/lib/services/index-now-pinger";
+import { ensureSitemapSubmitted } from "@/lib/services/indexing-onboarding";
 import { scanPostAfterPublishFireAndForget } from "@/lib/services/post-seo-runner";
 import { relinkAfterPublishFireAndForget } from "@/lib/services/semantic-linking";
 import { resolveNicheConfig } from "@/lib/content/niche-config-db";
@@ -87,6 +94,19 @@ import { ctaColorHex } from "@/lib/content/cta-colors";
 import { resolveNextPostLanguage } from "@/lib/content/post-language";
 import { getAppBaseUrl } from "@/lib/services/link-tracker";
 import { revalidatePath } from "next/cache";
+import {
+  buildPostingPlan,
+  formatPostingPlan,
+  normalizePostingPlan,
+  planDays,
+  planToFormValues,
+} from "@/lib/posting-plan";
+import {
+  isQueryCoveredByBlog,
+  recordCoveredQuery,
+} from "@/lib/content/topic-candidates";
+import { findMostSimilarTitle } from "@/lib/content/topic-similarity";
+import { markKeywordTargetSkipped } from "@/lib/actions/keyword-target-actions";
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -111,8 +131,7 @@ interface GetBlogsResult {
     seoPlugin: string | null;
     shopifyStoreUrl: string | null;
     city: string | null;
-    postingFrequency: string | null;
-    postingFrequencyDays: number[] | null;
+    postingPlan: number[];
     lastPostVerifiedAt: Date | null;
     lastPostTitle: string | null;
     currentSeoScore: number | null;
@@ -138,18 +157,6 @@ const cleanValueOrUndefined = (
   if (v === undefined) return undefined;
   if (v === null) return null;
   return v.trim().length > 0 ? v.trim() : null;
-};
-
-// Normalize a posting-days value into a clean int[] (1-7, deduped, sorted)
-// or null when the user clears the schedule.
-const cleanPostingDays = (
-  v: number[] | null | undefined,
-): number[] | null => {
-  if (!v || v.length === 0) return null;
-  const cleaned = Array.from(
-    new Set(v.filter((n) => Number.isInteger(n) && n >= 1 && n <= 7)),
-  ).sort((a, b) => a - b);
-  return cleaned.length > 0 ? cleaned : null;
 };
 
 // Postgres unique-violation
@@ -212,8 +219,7 @@ export async function getBlogs(
       seoPlugin: blogs.seoPlugin,
       shopifyStoreUrl: blogs.shopifyStoreUrl,
       city: blogs.city,
-      postingFrequency: blogs.postingFrequency,
-      postingFrequencyDays: blogs.postingFrequencyDays,
+      postingPlan: blogs.postingPlan,
       lastPostVerifiedAt: blogs.lastPostVerifiedAt,
       lastPostTitle: blogs.lastPostTitle,
       currentSeoScore: blogs.currentSeoScore,
@@ -257,8 +263,6 @@ export type ExportBlogsResult =
  * realistic network size (docs put the target ceiling at ~3,500 blogs). */
 const EXPORT_ROW_CAP = 20000;
 
-const CSV_WEEKDAY_SHORT = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-
 function csvCell(value: string): string {
   return /[",\r\n]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value;
 }
@@ -293,8 +297,7 @@ export async function exportBlogsCsv(
       currentSeoScore: blogs.currentSeoScore,
       lastPostVerifiedAt: blogs.lastPostVerifiedAt,
       lastPostTitle: blogs.lastPostTitle,
-      postingFrequency: blogs.postingFrequency,
-      postingFrequencyDays: blogs.postingFrequencyDays,
+      postingPlan: blogs.postingPlan,
       createdAt: blogs.createdAt,
     })
     .from(blogs)
@@ -315,17 +318,12 @@ export async function exportBlogsCsv(
     "SEO Score",
     "Last Post Date",
     "Last Post Title",
-    "Posting Frequency",
-    "Posting Days",
+    "Posting Schedule",
     "Created At",
   ];
 
   const lines = [header.map(csvCell).join(",")];
   for (const r of rows) {
-    const days = (r.postingFrequencyDays ?? [])
-      .filter((d): d is number => d >= 1 && d <= 7)
-      .map((d) => CSV_WEEKDAY_SHORT[d - 1])
-      .join(" ");
     const cells = [
       r.domain,
       r.clientName ?? "",
@@ -338,8 +336,7 @@ export async function exportBlogsCsv(
       r.currentSeoScore != null ? String(r.currentSeoScore) : "",
       r.lastPostVerifiedAt ? new Date(r.lastPostVerifiedAt).toISOString().slice(0, 10) : "",
       r.lastPostTitle ?? "",
-      r.postingFrequency ?? "",
-      days,
+      formatPostingPlan(normalizePostingPlan(r.postingPlan)),
       new Date(r.createdAt).toISOString().slice(0, 10),
     ];
     lines.push(cells.map((c) => csvCell(c)).join(","));
@@ -421,8 +418,7 @@ export async function getBlog(id: string) {
       shopifyClientSecret: blogs.shopifyClientSecret,
       shopifyBlogHandle: blogs.shopifyBlogHandle,
       shopifyGrantedScopes: blogs.shopifyGrantedScopes,
-      postingFrequency: blogs.postingFrequency,
-      postingFrequencyDays: blogs.postingFrequencyDays,
+      postingPlan: blogs.postingPlan,
       lastPostVerifiedAt: blogs.lastPostVerifiedAt,
       lastPostTitle: blogs.lastPostTitle,
       currentSeoScore: blogs.currentSeoScore,
@@ -467,6 +463,13 @@ export async function createBlog(data: unknown) {
 
   const input = parsed.data;
 
+  // Canonical cadence. The Zod schema has already guaranteed that an
+  // "active" blog has at least one posting day and that the weekly total is
+  // within range, so this cannot silently produce an unpublishable active
+  // blog.
+  const postingPlan = buildPostingPlan(input.postingDays ?? [], input.postsPerDay ?? 1);
+  const legacyDays = planDays(postingPlan);
+
   try {
     const [inserted] = await db
       .insert(blogs)
@@ -483,9 +486,16 @@ export async function createBlog(data: unknown) {
         shopifyAdminApiToken: cleanValue(input.shopifyAdminApiToken),
         shopifyClientId: cleanValue(input.shopifyClientId),
         shopifyClientSecret: cleanValue(input.shopifyClientSecret),
-        // Frequency is now always "weekly" — fall back if the form omits it.
-        postingFrequency: cleanValue(input.postingFrequency) ?? "weekly",
-        postingFrequencyDays: cleanPostingDays(input.postingFrequencyDays),
+        postingPlan,
+        // ── LEGACY DUAL-WRITE — DELETE WITH MIGRATION 0044 ──
+        // Kept for exactly one release so a code rollback still finds a
+        // usable schedule in the old columns. Nothing READS these.
+        // postsPerDay stays null on purpose: the old verifier preferred it
+        // over the day array and would have expected 7x too many posts.
+        postingFrequency: "weekly",
+        postingFrequencyDays: legacyDays.length > 0 ? legacyDays : null,
+        postsPerDay: null,
+        // ── END LEGACY DUAL-WRITE ──
         status: input.status,
         notesInternal: cleanValue(input.notesInternal),
         city: cleanValue(input.city),
@@ -510,6 +520,43 @@ export async function createBlog(data: unknown) {
     } catch (profileErr) {
       console.error("Style profile assignment threw:", profileErr);
     }
+
+    // Search Console property provisioning (T04). FIRE-AND-FORGET, deliberately:
+    // the chain is getToken -> theme write -> verifyOwnership -> sites.add ->
+    // sitemaps.submit, five external round trips that would add 5-15s to a form
+    // submit. Same idiom as pingIndexNowFireAndForget and safe for the same
+    // reason — this runs on a long-lived Node server (`next start` on Render),
+    // not a function that freezes after the response.
+    //
+    // A WordPress blog comes back "pending_dns" with the TXT value stored on the
+    // row; the daily /api/cron/gsc-sync?verify=1 pass retries until the record is
+    // published, so nothing is lost if this attempt does not complete.
+    void (async () => {
+      try {
+        const [row] = await db.select().from(blogs).where(eq(blogs.id, inserted.id));
+        if (!row) return;
+        const gsc = await provisionGscProperty(row);
+        if (gsc.status === "pending_dns") {
+          console.info(
+            `[gsc-verify] ${row.domain} awaiting DNS TXT — publish at the apex: ${gsc.token ?? "(token not returned)"}`,
+          );
+        } else if (gsc.status === "failed") {
+          console.warn(
+            `[gsc-verify] provisioning failed for ${row.domain}: ${gsc.message ?? "unknown"}`,
+          );
+        }
+      } catch (gscErr) {
+        console.error("Search Console provisioning threw:", gscErr);
+      }
+    })();
+
+    // Get this blog's sitemap into Search Console (T15). Fire-and-forget for
+    // the same reason as the block above; the daily /api/cron/index-submit
+    // sweep is the durable path and picks this up if the floating promise is
+    // cut short when the request ends.
+    void ensureSitemapSubmitted(inserted.id).catch((err) => {
+      console.error("[gsc] onboarding sitemap submit threw:", err);
+    });
 
     revalidatePath("/blogs");
     return { id: inserted.id };
@@ -566,12 +613,32 @@ export async function updateBlog(id: string, data: unknown) {
     updateData.shopifyClientSecret = cleanValueOrUndefined(
       input.shopifyClientSecret,
     );
-  if (input.postingFrequency !== undefined)
-    updateData.postingFrequency = cleanValueOrUndefined(input.postingFrequency);
-  if (input.postingFrequencyDays !== undefined)
-    updateData.postingFrequencyDays = cleanPostingDays(
-      input.postingFrequencyDays,
-    );
+  // Canonical cadence. Rebuilt whenever EITHER half was submitted; the half
+  // that wasn't falls back to what is already stored. postingDays === []
+  // (as opposed to undefined) means the operator deliberately cleared the
+  // schedule, and updateBlogSchema has already rejected that for an active
+  // blog.
+  if (input.postingDays !== undefined || input.postsPerDay !== undefined) {
+    const [current] = await db
+      .select({ postingPlan: blogs.postingPlan })
+      .from(blogs)
+      .where(eq(blogs.id, id));
+    if (!current) {
+      return { error: "Blog not found" };
+    }
+    const stored = planToFormValues(normalizePostingPlan(current.postingPlan));
+    const days = input.postingDays ?? stored.days;
+    const perDay = input.postsPerDay ?? stored.postsPerDay;
+    const plan = buildPostingPlan(days, perDay);
+    updateData.postingPlan = plan;
+    // ── LEGACY DUAL-WRITE — DELETE WITH MIGRATION 0044 ──
+    const updatedLegacyDays = planDays(plan);
+    updateData.postingFrequency = "weekly";
+    updateData.postingFrequencyDays =
+      updatedLegacyDays.length > 0 ? updatedLegacyDays : null;
+    updateData.postsPerDay = null;
+    // ── END LEGACY DUAL-WRITE ──
+  }
   if (input.status !== undefined) updateData.status = input.status;
   if (input.notesInternal !== undefined)
     updateData.notesInternal = cleanValueOrUndefined(input.notesInternal);
@@ -815,6 +882,10 @@ export async function testBlogConnection(
     const updateData: Record<string, unknown> = { updatedAt: new Date() };
     if (result.seoPlugin) {
       updateData.seoPlugin = result.seoPlugin;
+    }
+    // undefined => Shopify (leave alone); null => WP without the bridge (T14).
+    if (result.seoBridgeVersion !== undefined) {
+      updateData.seoBridgeVersion = result.seoBridgeVersion;
     }
     await db.update(blogs).set(updateData).where(eq(blogs.id, id));
   }
@@ -1101,11 +1172,34 @@ export async function generateBlogPost(
   // must not be reported back to the ledger as covering the claimed keyword.
   let generatedViaLocalTarget = false;
 
+  // Recorded on the post row; written to blog_covered_queries once the post is
+  // persisted, so this blog never re-covers the same query.
+  let primaryQuery: string | null = null;
+  let supportingQueries: string[] = [];
+
   if (!topic) {
     if (claimedTarget) {
-      topic = claimedTarget.topicTitle;
-      if (keywords.length === 0) keywords = [claimedTarget.keyword];
-    } else {
+      // The ledger path used to take topicTitle verbatim with no duplicate
+      // check at all. Same guard as the cron path.
+      const recentForLedger = await getRecentTitles(input.blogId, blog.clientId);
+      const ledgerDup = findMostSimilarTitle(claimedTarget.topicTitle, recentForLedger);
+      const alreadyCovered = await isQueryCoveredByBlog(input.blogId, claimedTarget.keyword);
+      if (ledgerDup || alreadyCovered) {
+        const why = ledgerDup
+          ? `title duplicates "${ledgerDup.title}" (${Math.round(ledgerDup.score * 100)}% word overlap)`
+          : `keyword "${claimedTarget.keyword}" is already covered by this blog`;
+        console.info(
+          `[generateBlogPost] skipping keyword target ${claimedTarget.id}: ${why}`,
+        );
+        await markKeywordTargetSkipped(claimedTarget.id, why);
+      } else {
+        topic = claimedTarget.topicTitle;
+        primaryQuery = claimedTarget.keyword;
+        if (keywords.length === 0) keywords = [claimedTarget.keyword];
+      }
+    }
+
+    if (!topic) {
       // Own + sibling-blog recent titles, so ideation avoids network-wide repeats.
       const recent = await getRecentTitles(input.blogId, blog.clientId);
 
@@ -1119,9 +1213,20 @@ export async function generateBlogPost(
             language: postLanguage,
             customPrompt,
             knowledge,
+            blogId: input.blogId,
           },
         );
+        if (idea.exhausted) {
+          return {
+            success: false,
+            message:
+              "Every demand-validated query for this blog is already covered. " +
+              "Refresh the client's keyword pool before generating again.",
+          };
+        }
         topic = idea.topic;
+        primaryQuery = idea.primaryQuery;
+        supportingQueries = idea.supportingQueries;
         if (keywords.length === 0) keywords = idea.keywords;
       } catch (err) {
         return {
@@ -1147,6 +1252,8 @@ export async function generateBlogPost(
       clientId: blog.clientId,
       topic,
       keywords,
+      primaryQuery,
+      supportingQueries,
       status: "generating",
       language: postLanguage,
       isAutoGenerated: false,
@@ -1283,7 +1390,13 @@ export async function generateBlogPost(
           language: postLanguage,
           customPrompt,
           knowledge,
+          blogId: input.blogId,
         });
+        if (newIdea.exhausted) {
+          throw new Error(
+            "Re-ideation exhausted: every demand-validated candidate for this blog is already covered",
+          );
+        }
         if (!newIdea.topic || newIdea.topic.trim() === currentTopic.trim()) {
           throw new Error("Re-ideation returned an empty or duplicate topic");
         }
@@ -1291,11 +1404,15 @@ export async function generateBlogPost(
         currentKeywords = newIdea.keywords.length > 0
           ? newIdea.keywords
           : currentKeywords;
+        primaryQuery = newIdea.primaryQuery;
+        supportingQueries = newIdea.supportingQueries;
         await db
           .update(generatedPosts)
           .set({
             topic: currentTopic,
             keywords: currentKeywords,
+            primaryQuery,
+            supportingQueries,
             updatedAt: new Date(),
           })
           .where(eq(generatedPosts.id, pending.id));
@@ -1358,6 +1475,22 @@ export async function generateBlogPost(
     }
   }
 
+  // Manual generate produces a DRAFT (publishGeneratedPost ships it later), so
+  // coverage is recorded at persist time: the subject is taken the moment a
+  // draft exists, otherwise the next run re-ideates straight into it. A draft
+  // the operator later deletes leaves an orphan coverage row — the release
+  // query is in docs/remediation-status.md.
+  if (primaryQuery) {
+    await recordCoveredQuery({
+      blogId: input.blogId,
+      clientId: blog.clientId,
+      query: primaryQuery,
+      topic: result.title || currentTopic,
+      generatedPostId: pending.id,
+      source: claimedTarget ? "ledger" : "ideation",
+    });
+  }
+
   // Cost log — per-post breakdown so the operator can spot drift fast.
   // text = Claude (Sonnet body + Haiku ideate/scene/etc., cache-aware).
   // images = estimated from GOOGLE_IMAGE_MODEL × #images actually produced
@@ -1417,6 +1550,37 @@ export async function generateBlogPost(
   });
 
   revalidatePath(`/blogs/${input.blogId}/posts`);
+
+  // 5b. THE GATE (T07), manual half. Applied HERE rather than inside
+  //     publishGeneratedPost on purpose: that action is also how a reviewer
+  //     RELEASES a held draft from the review queue, so gating it would make
+  //     held posts unreleasable. What must be gated is the automatic hop —
+  //     "Generate post" / "Trigger posts" with autoPublish, which is a
+  //     machine decision to go live, exactly like the cron.
+  if (
+    input.autoPublish &&
+    shouldHoldForReview(result.flaggedForReview ?? false)
+  ) {
+    const heldMessage = `${SCRUBBER_HOLD_PREFIX} ${scrubberSummary(result.scrubberReport)}`;
+    await db
+      .update(generatedPosts)
+      .set({
+        status: "generated",
+        failureReason: heldMessage,
+        updatedAt: new Date(),
+      })
+      .where(eq(generatedPosts.id, pending.id));
+    console.warn(`[scrubber-gate] held ${blog.domain} post=${pending.id}: ${heldMessage}`);
+    revalidatePath(`/blogs/${input.blogId}/posts`);
+    return {
+      success: true,
+      generatedPostId: pending.id,
+      publishResult: {
+        success: false,
+        message: `${heldMessage} — review and publish it manually to override.`,
+      },
+    };
+  }
 
   // 6. Optional immediate publish
   if (input.autoPublish) {
@@ -1717,7 +1881,7 @@ export async function publishGeneratedPost(
         .from(blogs)
         .where(eq(blogs.id, post.blogId));
       if (fullBlog) {
-        pingIndexNowFireAndForget(fullBlog, result.postUrl);
+        pingIndexNowFireAndForget(fullBlog, result.postUrl, generatedPostId);
       } else {
         console.warn(
           `[indexnow] SKIP — could not reload blog row for ping`,
@@ -2006,7 +2170,13 @@ export async function importBlogsFromCsv(
               wpUsername: row.wpUsername,
               wpAppPassword: row.wpAppPassword,
               seoPlugin: row.seoPlugin,
-              postingFrequency: row.postingFrequency,
+              postingPlan: row.postingPlan,
+              // ── LEGACY DUAL-WRITE — DELETE WITH MIGRATION 0044 ──
+              postingFrequency: "weekly",
+              postingFrequencyDays:
+                planDays(row.postingPlan).length > 0 ? planDays(row.postingPlan) : null,
+              postsPerDay: null,
+              // ── END LEGACY DUAL-WRITE ──
               status: "setup" as const,
             })),
           )
@@ -2026,7 +2196,13 @@ export async function importBlogsFromCsv(
               wpUsername: row.wpUsername,
               wpAppPassword: row.wpAppPassword,
               seoPlugin: row.seoPlugin,
-              postingFrequency: row.postingFrequency,
+              postingPlan: row.postingPlan,
+              // ── LEGACY DUAL-WRITE — DELETE WITH MIGRATION 0044 ──
+              postingFrequency: "weekly",
+              postingFrequencyDays:
+                planDays(row.postingPlan).length > 0 ? planDays(row.postingPlan) : null,
+              postsPerDay: null,
+              // ── END LEGACY DUAL-WRITE ──
               status: "setup",
             });
             result.successCount++;

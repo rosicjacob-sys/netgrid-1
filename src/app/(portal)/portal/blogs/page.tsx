@@ -6,6 +6,7 @@ import { blogs } from "@/lib/db/schema";
 import { eq, and, desc } from "drizzle-orm";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { formatPostingPlan, normalizePostingPlan } from "@/lib/posting-plan";
 
 function seoBadgeColor(score: number | null) {
   if (score === null) return "bg-gray-100 text-gray-800";
@@ -25,7 +26,7 @@ export default async function PortalBlogsPage() {
       platform: blogs.platform,
       status: blogs.status,
       currentSeoScore: blogs.currentSeoScore,
-      postingFrequency: blogs.postingFrequency,
+      postingPlan: blogs.postingPlan,
       lastPostTitle: blogs.lastPostTitle,
       lastPostVerifiedAt: blogs.lastPostVerifiedAt,
     })
@@ -70,12 +71,12 @@ export default async function PortalBlogsPage() {
                       {blog.currentSeoScore ?? "—"}
                     </Badge>
                   </div>
-                  {blog.postingFrequency && (
-                    <div className="flex items-center justify-between">
-                      <span className="text-sm text-muted-foreground">Frequency</span>
-                      <span className="text-sm">{blog.postingFrequency}</span>
-                    </div>
-                  )}
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm text-muted-foreground">Schedule</span>
+                    <span className="text-sm">
+                      {formatPostingPlan(normalizePostingPlan(blog.postingPlan))}
+                    </span>
+                  </div>
                   {blog.lastPostTitle && (
                     <div className="border-t pt-2">
                       <p className="text-xs text-muted-foreground">Latest post</p>

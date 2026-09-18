@@ -1,24 +1,32 @@
-// Link Exchange engine — per-client full mesh.
+// Link Exchange engine — RETIRED (T03). DO NOT RE-ENABLE.
 //
-// Interlinks each opted-in client's OWN sites: every site links to every other
-// site the client owns (A→B, A→C, …, B→A, …). Never links across different
-// clients. Links are dripped one body-text link at a time into existing
-// published posts.
+// This module used to build a full directed mesh of reciprocal links between
+// every pair of a client's own active blogs, and drip one body-text link at a
+// time into live published posts. Each placed link carried a machine-readable
+// data-nx-exch="{edgeId}" attribute inside one of three fixed carrier
+// sentences, with no rel qualifier — a network-wide, joinable fingerprint of a
+// reciprocal link scheme.
 //
-// Guardrails from the brief are baked in:
-//   - opt-in per client; mesh scoped to a single client's sites
-//   - anchor mix ≈ 85% branded/naked, <10% partial, <5% exact, varied
-//   - drip: ≤1 placement per source blog per run, throttled, one exchange
-//     link per host post
-//   - inline body-text links only (no footer/sidebar/"related" block)
+// The engine is now inert:
+//   - LINK_EXCHANGE_RETIRED below short-circuits every exported entry point.
+//   - The cron route (/api/cron/link-exchange) returns 410 and does not import
+//     this module at all.
+//   - The Render cron service was deleted from render.yaml.
+//   - Migration 0041 opted every client out and moved every unplaced edge to
+//     the terminal 'disabled' status.
 //
-// Note: a full mesh implies mutual A↔B links (a dense reciprocal cluster) — a
-// stronger footprint than an ABC cycle, chosen deliberately for interlinking a
-// client's own network of sites.
+// The placement code below is deliberately left in place, unreachable, as the
+// record of what was done. Links already live are removed by
+// src/lib/services/link-exchange-removal.ts.
 //
-// Best-effort throughout: a failing placement is recorded and retried later,
-// never fatal.
+// Re-enabling requires editing this constant, which is intentional: it forces a
+// code review rather than a config toggle. Do not add an env-var escape hatch.
+// Typed as `boolean`, not inferred as `true`, so TypeScript does not narrow the
+// rest of each function to unreachable code (which would fail lint).
+const LINK_EXCHANGE_RETIRED: boolean = true;
 
+const RETIRED_REASON =
+  "Link exchange retired (T03) — placements are permanently disabled.";
 import { db } from "@/lib/db";
 import {
   blogs,
@@ -141,6 +149,8 @@ export async function buildLoops(): Promise<{
   loopsCreated: number;
   edgesCreated: number;
 }> {
+  if (LINK_EXCHANGE_RETIRED) return { loopsCreated: 0, edgesCreated: 0 };
+
   const eligible = await db
     .select({
       id: blogs.id,
@@ -337,8 +347,10 @@ export interface PlaceResult {
   reason?: string;
 }
 
-/** Place one pending edge's link into a host post on the source blog. */
+/** RETIRED (T03) — always refuses. See the module header. */
 export async function placeEdge(edgeId: string): Promise<PlaceResult> {
+  if (LINK_EXCHANGE_RETIRED) return { ok: false, reason: RETIRED_REASON };
+
   const [edge] = await db
     .select()
     .from(linkExchangeEdges)
@@ -453,7 +465,7 @@ async function fail(edgeId: string, reason: string): Promise<PlaceResult> {
   return { ok: false, reason };
 }
 
-// ─── Cron entry point ────────────────────────────────────────────────────────
+// ─── Cron entry point (RETIRED) ──────────────────────────────────────────────
 
 export interface LinkExchangeRunResult {
   loopsCreated: number;
@@ -461,15 +473,32 @@ export interface LinkExchangeRunResult {
   placed: number;
   placeFailed: number;
   errors?: Array<{ edgeId: string; reason: string }>;
+  /** Set when the engine refused to run at all (it is retired). */
+  skipped?: string;
 }
 
 /**
- * Build any new loops, then drip-place pending edges: at most one per source
- * blog per run, capped and throttled, oldest-first so failures rotate.
+ * RETIRED (T03). Returns a zeroed result with `skipped` set and touches
+ * nothing. Kept as a function rather than deleted so any forgotten caller
+ * fails loudly in its response body instead of throwing a 500 that looks like
+ * an outage. The real gate is the 410 on the cron route.
  */
 export async function runLinkExchange(
   options: { limit?: number } = {},
 ): Promise<LinkExchangeRunResult> {
+  if (LINK_EXCHANGE_RETIRED) {
+    console.warn(
+      `[link-exchange] runLinkExchange called after retirement (limit=${options.limit ?? "default"}) — find and remove the caller`,
+    );
+    return {
+      loopsCreated: 0,
+      edgesCreated: 0,
+      placed: 0,
+      placeFailed: 0,
+      skipped: RETIRED_REASON,
+    };
+  }
+
   const { loopsCreated, edgesCreated } = await buildLoops();
   const limit = Math.min(Math.max(options.limit ?? maxPlacementsPerRun(), 1), 100);
 

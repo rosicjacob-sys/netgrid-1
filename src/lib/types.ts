@@ -53,6 +53,13 @@ export interface ConnectionResult {
   platform?: Platform;
   wpVersion?: string;
   seoPlugin?: SeoPlugin;
+  /**
+   * Version reported by the netgrid-seo-bridge MU-plugin, or null when it is
+   * not installed. Without the bridge, Yoast meta is NOT REST-writable on the
+   * site (see docs/wordpress/netgrid-seo-bridge.php). undefined means the
+   * probe was not applicable (Shopify).
+   */
+  seoBridgeVersion?: string | null;
   userRole?: string;
   shopifyStoreName?: string;
   shopifyPlan?: string;
@@ -124,6 +131,18 @@ export interface PublishPostResult {
    * treated as "unverified" by the auto-publish counter — see T14.
    */
   metaStatus?: MetaWriteStatus;
+  /**
+   * WordPress only. Whether the SEO meta we wrote was confirmed on the LIVE
+   * page. WordPress returns 200 for meta writes it silently discards, so this
+   * is the only trustworthy signal (T14).
+   *   true      - confirmed in the live <head>
+   *   false     - the page was fetched and shows something else
+   *   null      - checked but the page was unreachable
+   *   undefined - not applicable (Shopify, draft, or no meta supplied)
+   */
+  seoMetaVerified?: boolean | null;
+  /** Operator-readable explanation of seoMetaVerified. */
+  seoMetaMessage?: string;
 }
 
 // Activity log entry details

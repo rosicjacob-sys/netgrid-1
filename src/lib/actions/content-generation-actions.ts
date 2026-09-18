@@ -3,7 +3,7 @@
 import crypto from "crypto";
 import { db } from "@/lib/db";
 import { blogs, clients, generatedPosts } from "@/lib/db/schema";
-import { and, asc, desc, eq, gte, isNotNull, ne, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNotNull, isNull, lt, ne, or, sql } from "drizzle-orm";
 import { requireAdmin } from "@/lib/auth/helpers";
 import {
   generateContent,
@@ -29,14 +29,45 @@ import {
   claimKeywordTargetForBlog,
   markKeywordTargetGenerated,
   markKeywordTargetFailed,
+  markKeywordTargetSkipped,
+  releaseKeywordTargetClaim,
+  releaseStuckKeywordTargets,
   type ClaimedKeywordTarget,
 } from "@/lib/actions/keyword-target-actions";
+import { isTransientFailure, utcDayKey } from "@/lib/content/publish-slots";
+import { shardForBlog } from "@/lib/cron/sharding";
+import { blogHasCredentials } from "@/lib/cron/cadence";
+import { logActivity } from "@/lib/services/activity-logger";
+import {
+  formatPostingPlan,
+  isoWeekdayUtc,
+  normalizePostingPlan,
+  postsPerWeek,
+  quotaForDate,
+  WEEKDAY_NAMES,
+} from "@/lib/posting-plan";
+import {
+  getIdeationCandidatesForBlog,
+  isQueryCoveredByBlog,
+  recordCoveredQuery,
+} from "@/lib/content/topic-candidates";
+import { findMostSimilarTitle } from "@/lib/content/topic-similarity";
 import { ctaColorHex } from "@/lib/content/cta-colors";
 import { resolveNextPostLanguage } from "@/lib/content/post-language";
 import { getAppBaseUrl } from "@/lib/services/link-tracker";
 import { pingIndexNowFireAndForget } from "@/lib/services/index-now-pinger";
 import { scanPostAfterPublishFireAndForget } from "@/lib/services/post-seo-runner";
-import { logScrubberVerdict } from "@/lib/content/scrubber";
+import {
+  findTopicalLinkRefs,
+  relinkAfterPublishFireAndForget,
+} from "@/lib/services/semantic-linking";
+import { toCanonicalUrl } from "@/lib/services/canonical-url";
+import {
+  logScrubberVerdict,
+  shouldHoldForReview,
+  scrubberSummary,
+  SCRUBBER_HOLD_PREFIX,
+} from "@/lib/content/scrubber";
 import {
   runWithTelemetry,
   withBlog,
@@ -68,8 +99,29 @@ export interface GenerateAndPublishInput {
 
 export interface GenerateAndPublishResult {
   success: boolean;
+  /**
+   * The generated_posts row this run created. Empty string when the run never
+   * created one — i.e. status "skipped", where another process already holds
+   * this blog's publishing slot for the UTC day.
+   */
   generatedPostId: string;
-  status: "published" | "generated" | "failed";
+  /**
+   * "skipped" = the day-slot claim was lost to a concurrent run (T08). Not a
+   * failure: the other run is publishing this blog right now.
+   */
+  status: "published" | "generated" | "failed" | "skipped";
+  /**
+   * True when the failure looks retryable inside the same cron tick (rate
+   * limit, upstream 5xx, network blip).
+   *
+   * This field exists because runGenerateAndPublish CATCHES its own errors
+   * and RETURNS a result: everything from generation onward sits inside the
+   * try block and is swallowed by its catch. A caller that only inspects
+   * thrown errors therefore never sees the dominant failure class, which is
+   * exactly the bug that made the retry in publishOneInner dead code. Always
+   * false on success and on "skipped".
+   */
+  transient: boolean;
   externalPostId?: string | number;
   externalPostUrl?: string;
   message: string;
@@ -77,50 +129,51 @@ export interface GenerateAndPublishResult {
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-function blogHasCredentials(blog: typeof blogs.$inferSelect): boolean {
-  if (blog.platform === "shopify") {
-    if (!blog.shopifyStoreUrl) return false;
-    // Two auth modes:
-    //   legacy_token       — needs shopifyAdminApiToken
-    //   client_credentials — needs shopifyClientId + shopifyClientSecret
-    // Default to client_credentials when the column is null (matches the DB default).
-    const mode = blog.shopifyAuthMode ?? "client_credentials";
-    if (mode === "legacy_token") return Boolean(blog.shopifyAdminApiToken);
-    return Boolean(blog.shopifyClientId && blog.shopifyClientSecret);
-  }
-  return Boolean(blog.wpUrl && blog.wpUsername && blog.wpAppPassword);
-}
-
 /** Start of the current UTC day (used for the per-day cap). */
 function startOfUtcDay(now: Date): Date {
   return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
 }
 
 /**
- * Parse the blogs.posting_frequency varchar as a positive integer = posts per
- * UTC day. Accepts plain numbers ("2") or patterns like "2x per day", "2/day",
- * "2 posts per day". Anything else (e.g. "3x per week") returns null and the
- * caller falls back to posting_frequency_days.
+ * How many publishing slots this blog already holds for a UTC day (T08).
+ *
+ * Occupying statuses are 'generating' / 'publishing' (in flight) and
+ * 'published' (done) — exactly the predicate of the
+ * generated_posts_blog_day_slot_uniq index, so the number this returns is the
+ * next free slot. 'generated' (article written, platform publish failed) and
+ * 'failed' are excluded so a broken attempt frees its slot for a retry on the
+ * next tick.
+ *
+ * Counts ONLY rows that carry a publish_day, i.e. auto-publish claims. Manual
+ * posts (publish_day null) are counted by the cadence gate in
+ * runAutoPublishCron, not by the slot allocator. Mixing them in would make the
+ * next slot number depend on when a human happened to click "Generate", so two
+ * racing sweeps could compute DIFFERENT slots and both succeed — which is the
+ * exact failure this whole task exists to prevent.
  */
-function parsePostsPerDay(value: string | null | undefined): number | null {
-  if (!value) return null;
-  const trimmed = value.trim();
-  if (!trimmed) return null;
-
-  const direct = Number(trimmed);
-  if (Number.isInteger(direct) && direct > 0) return direct;
-
-  const match = trimmed.match(/(\d+)\s*(?:x|\/|\s)*(?:posts?\s*)?(?:per\s*)?day/i);
-  if (match) {
-    const n = parseInt(match[1], 10);
-    if (Number.isInteger(n) && n > 0) return n;
-  }
-  return null;
+async function countClaimedSlotsForDay(
+  blogId: string,
+  publishDay: string,
+): Promise<number> {
+  const [row] = await db
+    .select({ n: sql<number>`count(*)::int` })
+    .from(generatedPosts)
+    .where(
+      and(
+        eq(generatedPosts.blogId, blogId),
+        eq(generatedPosts.publishDay, publishDay),
+        inArray(generatedPosts.status, ["generating", "publishing", "published"]),
+      ),
+    );
+  return row?.n ?? 0;
 }
 
-/** The cron runs every 6 hours, so same-day posts are naturally spaced at
- * least this far apart. We also enforce it in code so manual cron pokes can't
- * ship two posts back-to-back. */
+/**
+ * Safety floor between two publishes on the same blog. The auto-publish cron
+ * ticks hourly (render.yaml: "0 * * * *"), so this is what actually spaces
+ * multi-post days apart, and it also stops a manual cron poke from shipping
+ * two posts back-to-back.
+ */
 const MIN_HOURS_BETWEEN_POSTS = 6;
 
 /**
@@ -148,19 +201,36 @@ const MAX_BLOGS_PER_CRON_RUN = Number(
 void process.env.AUTO_PUBLISH_INTER_BLOG_DELAY_MS; // legacy env, no longer read
 
 /**
- * Deterministic preferred publishing hour (0-23 UTC) for a blog, derived
- * from its UUID. Same blog ⇒ same hour, forever. This is what spreads
- * publishes across the day so multiple due blogs don't all hit the
- * Shopify / Anthropic / Google APIs in the same minute.
+ * Width of the daily publishing window, in hourly cron ticks.
  *
- *   blog A (uuid c26a8…) → hour 9    (publishes at 09:00 UTC on its days)
- *   blog B (uuid f12d3…) → hour 14   (publishes at 14:00 UTC on its days)
- *   blog C (uuid 4a9b2…) → hour 22   (publishes at 22:00 UTC on its days)
+ * Preferred hours are drawn from 0..PUBLISH_WINDOW_HOURS-1 rather than 0..23
+ * so that EVERY blog has several ticks of runway before the UTC day rolls
+ * over. With the old 0..23 range a blog hashed to hour 23 had exactly one
+ * chance per scheduled day; if that tick was over the per-run cap, or the
+ * function deadline cut the run short, the post was lost until the next
+ * matching weekday (the cadence policy is strict day-only, no catch-up — see
+ * isBlogDueForPost). At 18 the worst slot still gets 7 ticks.
+ *
+ * Raising this back toward 24 re-introduces the starvation; lowering it
+ * increases per-hour publish density. 18 keeps peak in-flight publishes
+ * (4 shards x AUTO_PUBLISH_CONCURRENCY) inside the API headroom.
+ */
+const PUBLISH_WINDOW_HOURS = 18;
+
+/**
+ * Deterministic preferred publishing hour (0..PUBLISH_WINDOW_HOURS-1 UTC)
+ * for a blog, derived from its UUID. Same blog => same hour, forever. This
+ * is what spreads publishes across the day so multiple due blogs don't all
+ * hit the Shopify / Anthropic / Google APIs in the same minute.
+ *
+ *   blog A (uuid c26a8...) -> hour 9    (publishes at 09:00 UTC on its days)
+ *   blog B (uuid f12d3...) -> hour 14   (publishes at 14:00 UTC on its days)
+ *   blog C (uuid 4a9b2...) -> hour 4    (publishes at 04:00 UTC on its days)
  *
  * The cron only considers a blog due once the current hour has reached or
  * passed the blog's preferred hour. Late cron runs (cron paused, server
- * restart, etc.) still catch up — a blog scheduled for 09:00 that the
- * cron sees at 14:00 still gets published, because 14 ≥ 9.
+ * restart, etc.) still catch up within the same UTC day — a blog scheduled
+ * for 09:00 that the cron sees at 14:00 still gets published, because 14 >= 9.
  */
 function preferredHourForBlog(blogId: string): number {
   const hex = crypto
@@ -168,29 +238,7 @@ function preferredHourForBlog(blogId: string): number {
     .update(blogId)
     .digest("hex")
     .slice(0, 8);
-  return parseInt(hex, 16) % 24;
-}
-
-/**
- * Stable shard assignment for a blog — same blog ⇒ same shard, forever.
- * Used to partition the active blog pool across parallel auto-publish
- * cron services. Each service is configured with (shardIndex, shardCount)
- * via query string and only processes blogs where:
- *
- *   shardForBlog(blog.id, shardCount) === shardIndex
- *
- * Uses bytes 8-15 of the SHA1 hex (different than preferredHourForBlog
- * which uses bytes 0-7) so a blog's shard assignment is independent of
- * its hour assignment.
- */
-function shardForBlog(blogId: string, shardCount: number): number {
-  if (shardCount <= 1) return 0;
-  const hex = crypto
-    .createHash("sha1")
-    .update(blogId)
-    .digest("hex")
-    .slice(8, 16);
-  return parseInt(hex, 16) % shardCount;
+  return parseInt(hex, 16) % PUBLISH_WINDOW_HOURS;
 }
 
 /** Reason a blog is or isn't due. */
@@ -199,35 +247,29 @@ type DueDecision =
   | { due: false; reason: string };
 
 /**
- * Cadence eligibility — does NOT check the per-client total cap (that needs a
- * separate query, done in runAutoPublishCron).
+ * Cadence eligibility against the canonical posting plan. Does NOT check the
+ * per-client total cap (that needs a separate query, done in
+ * runAutoPublishCron).
  *
- * Logic:
- *   - If blogs.posting_frequency parses to a positive integer (= posts/day):
- *     today's published count must be < that number, AND
- *     lastPostVerifiedAt must be >= MIN_HOURS_BETWEEN_POSTS ago.
- *   - Else if blogs.posting_frequency_days is set (e.g. [2,5] = Tue/Fri):
- *     current weekday must be in the array AND no post already published
- *     today AND MIN_HOURS_BETWEEN_POSTS safety floor against the last post.
- *   - Else: not auto-publishable.
+ * blogs.posting_plan is an integer[7]: entry i = posts wanted on ISO weekday
+ * i+1, UTC. See src/lib/posting-plan.ts. This single field replaced
+ * posting_frequency / posting_frequency_days / posts_per_day, which used to
+ * be three sources of truth that disagreed.
+ *
+ * Order of checks:
+ *   1. Empty plan            -> not schedulable. Should be unreachable here:
+ *                               runAutoPublishCron filters empty plans out at
+ *                               the DB layer and alerts on them separately.
+ *                               Kept as a belt-and-braces guard.
+ *   2. Today's quota is 0    -> today is not one of the blog's weekdays.
+ *   3. Quota already met     -> enough posts for today already shipped.
+ *   4. MIN_HOURS_BETWEEN_POSTS safety floor against the real last publish.
+ *
+ * Semantics are unchanged from the previous day-array behaviour: a plan of
+ * [1,0,1,0,1,0,0] permits exactly one post on Mon/Wed/Fri. A plan of
+ * [2,2,2,2,2,2,2] permits two per day, six hours apart — which is what the
+ * old "2 posts per day" posting_frequency string did.
  */
-/** ISO weekday (1 = Monday … 7 = Sunday) from a Date in UTC. */
-function isoWeekdayUtc(d: Date): number {
-  const day = d.getUTCDay(); // 0 = Sunday … 6 = Saturday
-  return ((day + 6) % 7) + 1; // 1 = Mon … 7 = Sun
-}
-
-const WEEKDAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-
-function formatWeekdayList(days: number[]): string {
-  return days.map((d) => WEEKDAY_NAMES[d - 1] ?? `?${d}`).join(", ");
-}
-
-// daysSinceLastPost + maxGapDaysForWeekdays were used by the catch-up
-// path that bypassed the day filter when a blog missed its scheduled
-// day. Removed — the platform now enforces a strict day-only policy:
-// the only way a blog publishes is if today is in its configured days.
-
 function isBlogDueForPost(
   blog: typeof blogs.$inferSelect,
   todaysPublishedCount: number,
@@ -244,81 +286,53 @@ function isBlogDueForPost(
   const last = lastPublishedAt;
   const hour = 1000 * 60 * 60;
 
-  const postsPerDay = parsePostsPerDay(blog.postingFrequency);
-  const configuredDays = Array.isArray(blog.postingFrequencyDays)
-    ? blog.postingFrequencyDays
-    : null;
-  const hasDayFilter = configuredDays !== null && configuredDays.length > 0;
+  const plan = normalizePostingPlan(blog.postingPlan);
 
-  // PRIORITY: when posting_frequency_days is set, it is THE day filter.
-  // The legacy posting_frequency field (parsed by parsePostsPerDay) only
-  // owns the schedule when posting_frequency_days is empty. This stops
-  // legacy/CSV data with posting_frequency="1" or "2x per day" from
-  // bypassing the weekday picker the operator configured in the form.
-  if (postsPerDay !== null && !hasDayFilter) {
-    if (todaysPublishedCount >= postsPerDay) {
-      return {
-        due: false,
-        reason: `daily cap hit (${todaysPublishedCount}/${postsPerDay} today)`,
-      };
-    }
-    if (last) {
-      const hoursSince = (now.getTime() - last.getTime()) / hour;
-      if (hoursSince < MIN_HOURS_BETWEEN_POSTS) {
-        return {
-          due: false,
-          reason: `${hoursSince.toFixed(1)}h since last post < ${MIN_HOURS_BETWEEN_POSTS}h interval`,
-        };
-      }
-    }
-    return { due: true };
+  // 1. No schedule at all. This is a configuration fault, not a routine
+  //    skip — runAutoPublishCron reports it as `unscheduledActiveBlogs`
+  //    and /api/notifications raises it as a critical item.
+  if (postsPerWeek(plan) === 0) {
+    return {
+      due: false,
+      reason:
+        "no posting plan configured — blogs.posting_plan is empty; " +
+        "set posting days on the blog before activating it",
+    };
   }
 
-  // postingFrequencyDays is an integer[] of ISO weekdays (e.g. [2,5] = Tue/Fri).
-  // Semantics: strict day-only — the blog publishes only when today
-  // matches one of the configured weekdays. No catch-up, no bypass,
-  // no exceptions. If a scheduled day is missed (cron outage, paused
-  // blog, etc.) the blog simply waits for the next matching weekday.
-  if (hasDayFilter && configuredDays) {
-    const today = isoWeekdayUtc(now);
+  const today = isoWeekdayUtc(now);
+  const quotaToday = quotaForDate(plan, now);
 
-    // 1. Strict day filter. Today MUST be a configured weekday.
-    if (!configuredDays.includes(today)) {
-      return {
-        due: false,
-        reason: `today is ${WEEKDAY_NAMES[today - 1]}; configured days are [${formatWeekdayList(configuredDays)}]`,
-      };
-    }
-
-    // 2. Already posted today? Block re-publish — one post per
-    //    configured day.
-    if (todaysPublishedCount > 0) {
-      return {
-        due: false,
-        reason: `already published today (${todaysPublishedCount} post${todaysPublishedCount === 1 ? "" : "s"})`,
-      };
-    }
-
-    // 3. Safety floor against rapid-fire posts (cron poke / manual
-    //    trigger races). Never publish twice within 6 hours, even on
-    //    consecutive configured days.
-    if (last) {
-      const hoursSince = (now.getTime() - last.getTime()) / hour;
-      if (hoursSince < MIN_HOURS_BETWEEN_POSTS) {
-        return {
-          due: false,
-          reason: `${hoursSince.toFixed(1)}h since last post < ${MIN_HOURS_BETWEEN_POSTS}h safety floor`,
-        };
-      }
-    }
-
-    return { due: true };
+  // 2. Strict day filter. Today MUST carry a non-zero quota. No catch-up,
+  //    no bypass: a missed day waits for the next scheduled weekday.
+  if (quotaToday === 0) {
+    return {
+      due: false,
+      reason: `today is ${WEEKDAY_NAMES[today - 1]}; scheduled days are [${formatPostingPlan(plan)}]`,
+    };
   }
 
-  return {
-    due: false,
-    reason: "no cadence configured (set posting_frequency or posting_frequency_days)",
-  };
+  // 3. Daily quota.
+  if (todaysPublishedCount >= quotaToday) {
+    return {
+      due: false,
+      reason: `daily quota hit (${todaysPublishedCount}/${quotaToday} today)`,
+    };
+  }
+
+  // 4. Safety floor against rapid-fire posts (cron poke / manual trigger
+  //    races, and the gap between two posts on a multi-post day).
+  if (last) {
+    const hoursSince = (now.getTime() - last.getTime()) / hour;
+    if (hoursSince < MIN_HOURS_BETWEEN_POSTS) {
+      return {
+        due: false,
+        reason: `${hoursSince.toFixed(1)}h since last post < ${MIN_HOURS_BETWEEN_POSTS}h safety floor`,
+      };
+    }
+  }
+
+  return { due: true };
 }
 
 /**
@@ -371,37 +385,104 @@ export async function getRecentTitles(
 }
 
 /**
- * Pull the most recent published sibling posts on the same blog whose
- * platform URL is known — used by the content generator to weave inline
- * <a href> internal links into the article body. Per the footprint audit,
- * internal linking is the single SEO signal we were leaving on the table.
+ * The duplicate-detection corpus for a ledger-claimed title: the blog's own +
+ * sibling recent titles PLUS its permanent covered-topic history. Same corpus
+ * ideateTopic builds internally — the ledger path previously had none at all.
+ */
+async function buildLedgerDedupCorpus(
+  blogId: string,
+  clientId: string,
+): Promise<string[]> {
+  const [recent, candidateSet] = await Promise.all([
+    getRecentTitles(blogId, clientId),
+    getIdeationCandidatesForBlog(blogId),
+  ]);
+  return Array.from(
+    new Set(
+      [...recent, ...candidateSet.coveredTopics]
+        .map((t) => t.trim())
+        .filter(Boolean),
+    ),
+  );
+}
+
+/**
+ * Pick the published sibling posts the generator may weave into the article
+ * body as inline <a href> anchors.
+ *
+ * Selection is TOPICAL, not chronological: findTopicalLinkRefs scores every
+ * published sibling with the same hybrid (dense cosine + sparse full-text)
+ * formula the Related-posts engine uses, reusing embeddings that already exist
+ * on those rows. Two of the eight slots stay reserved for the most recent
+ * posts so brand-new pages keep accruing inbound internal links.
+ *
+ * Recency-only ordering (the previous behaviour) produced a chronological
+ * chain instead of topical clusters, so no pillar structure could form.
+ *
+ * URLs are canonicalised: external_post_url is the PLATFORM url, which on
+ * Shopify is xyz.myshopify.com.
+ *
+ * Falls back to the old recency query if the topical path returns nothing or
+ * throws — a missing internal-link block is worse than a chronological one.
  */
 async function getInternalLinkRefs(
-  blogId: string,
-  limit = 8,
+  blog: typeof blogs.$inferSelect,
+  opts: {
+    topic: string;
+    keywords?: string[];
+    language?: string | null;
+    limit?: number;
+    /** Regenerate path: don't offer a post its own URL as a link target. */
+    excludePostId?: string;
+  },
 ): Promise<Array<{ title: string; url: string }>> {
+  const limit = opts.limit ?? 8;
+
+  try {
+    const refs = await findTopicalLinkRefs({
+      blogId: blog.id,
+      canonicalDomain: blog.domain,
+      topic: opts.topic,
+      keywords: opts.keywords ?? [],
+      language: opts.language ?? null,
+      limit,
+      recentSlots: 2,
+      excludePostId: opts.excludePostId,
+    });
+    if (refs.length > 0) {
+      return refs.map(({ title, url }) => ({ title, url }));
+    }
+  } catch (err) {
+    console.warn(
+      `[internal-links] topical selection failed for ${blog.domain}: ` +
+        `${err instanceof Error ? err.message : "unknown"} — using recency`,
+    );
+  }
+
   const rows = await db
     .select({
+      id: generatedPosts.id,
       title: generatedPosts.title,
       url: generatedPosts.externalPostUrl,
     })
     .from(generatedPosts)
     .where(
       and(
-        eq(generatedPosts.blogId, blogId),
+        eq(generatedPosts.blogId, blog.id),
         eq(generatedPosts.status, "published"),
         isNotNull(generatedPosts.externalPostUrl),
         isNotNull(generatedPosts.title),
+        opts.excludePostId ? ne(generatedPosts.id, opts.excludePostId) : undefined,
       ),
     )
     .orderBy(desc(generatedPosts.publishedAt))
     .limit(limit);
-  return rows
-    .filter(
-      (r): r is { title: string; url: string } =>
-        Boolean(r.title) && Boolean(r.url),
-    )
-    .map((r) => ({ title: r.title, url: r.url }));
+
+  return rows.flatMap((r) =>
+    r.title && r.url
+      ? [{ title: r.title, url: toCanonicalUrl(r.url, blog.domain) }]
+      : [],
+  );
 }
 
 // ─── Core: generate + publish for one blog ──────────────────────────────────
@@ -558,11 +639,39 @@ export async function runGenerateAndPublish(
   // ledger row must go back to 'failed' (retryable) rather than 'generated'.
   let generatedViaLocalTarget = false;
 
+  // The query this post covers + the sub-questions the article must answer.
+  // Both are recorded on the post row and, once published, in
+  // blog_covered_queries so this blog can never re-cover the subject.
+  let primaryQuery: string | null = null;
+  let supportingQueries: string[] = [];
+
   if (!topic) {
     if (claimedTarget) {
-      topic = claimedTarget.topicTitle;
-      if (keywords.length === 0) keywords = [claimedTarget.keyword];
-    } else {
+      // The local-keyword ledger used to bypass duplicate detection entirely:
+      // it took claimedTarget.topicTitle verbatim with no similarity check.
+      // Ledger titles are template-built from a CLIENT-WIDE keyword pool, so
+      // two near-identical scraped keywords produce two near-identical titles
+      // on the same blog. Check it against the same corpus ideation uses; on a
+      // hit, retire the ledger row and fall through to ideation.
+      const ledgerCorpus = await buildLedgerDedupCorpus(blog.id, blog.clientId);
+      const ledgerDup = findMostSimilarTitle(claimedTarget.topicTitle, ledgerCorpus);
+      const alreadyCovered = await isQueryCoveredByBlog(blog.id, claimedTarget.keyword);
+      if (ledgerDup || alreadyCovered) {
+        const why = ledgerDup
+          ? `title duplicates "${ledgerDup.title}" (${Math.round(ledgerDup.score * 100)}% word overlap)`
+          : `keyword "${claimedTarget.keyword}" is already covered by this blog`;
+        console.info(
+          `[runGenerateAndPublish] skipping keyword target ${claimedTarget.id} for ${blog.domain}: ${why}`,
+        );
+        await markKeywordTargetSkipped(claimedTarget.id, why);
+      } else {
+        topic = claimedTarget.topicTitle;
+        primaryQuery = claimedTarget.keyword;
+        if (keywords.length === 0) keywords = [claimedTarget.keyword];
+      }
+    }
+
+    if (!topic) {
       const recentTitles = await getRecentTitles(blog.id, blog.clientId);
       const ideated = await ideateTopic(clientNiche, recentTitles, {
         verticalKey: verticalForPost?.key ?? null,
@@ -570,29 +679,141 @@ export async function runGenerateAndPublish(
         language: postLanguage,
         knowledge,
         customPrompt,
+        blogId: blog.id,
       });
+      if (ideated.exhausted) {
+        // Deliberate: refusing to publish beats publishing a known duplicate.
+        // publishOne() treats this as non-transient (no retry) and records it
+        // in the run results, which is exactly the signal an operator needs —
+        // this blog wants a keyword refresh, not another post.
+        throw new Error(
+          `Topic ideation exhausted for ${blog.domain} — every demand-validated ` +
+            `candidate is already covered. Refresh this client's keyword pool ` +
+            `(/api/cron/refresh-keywords or a DataForSEO pull) before it can publish again.`,
+        );
+      }
       topic = ideated.topic;
+      primaryQuery = ideated.primaryQuery;
+      supportingQueries = ideated.supportingQueries;
       if (keywords.length === 0) keywords = ideated.keywords;
+      if (ideated.groundedIn === "fallback") {
+        console.warn(
+          `[runGenerateAndPublish] ${blog.domain}: topic was NOT grounded in query data ` +
+            `(client has no scraped keyword pool)`,
+        );
+      }
     }
   }
 
   if (!topic) throw new Error("Could not resolve a topic to write about");
 
-  // 4. Insert pending row to track the attempt
-  const [pending] = await db
-    .insert(generatedPosts)
-    .values({
-      blogId: blog.id,
-      clientId: blog.clientId,
-      topic,
-      keywords,
-      status: "generating",
-      language: postLanguage,
-      isAutoGenerated: input.isAutoGenerated ?? false,
-    })
-    .returning({ id: generatedPosts.id });
+  // 4. Claim this blog's publishing slot for the UTC day, then insert the
+  //    pending row that tracks the attempt (T08).
+  //
+  //    THE CLAIM *IS* THE INSERT. A partial unique index on
+  //    (blog_id, publish_day, day_slot) WHERE status IN
+  //    ('generating','publishing','published') means only one process can
+  //    ever hold a given slot. `ON CONFLICT DO NOTHING ... RETURNING` gives
+  //    us the winner/loser answer in a single round-trip, which is not a
+  //    stylistic choice: src/lib/db/index.ts builds the client on
+  //    drizzle-orm/neon-http, and the Neon HTTP driver has no interactive
+  //    session — SELECT ... FOR UPDATE followed by an INSERT in one
+  //    transaction is simply not available here.
+  //
+  //    day_slot exists because a blog may legitimately publish more than
+  //    once a day: a posting_plan entry may be greater than 1, and
+  //    isBlogDueForPost permits todaysPublishedCount < that quota. Slot n
+  //    is the (n+1)-th post of the day. countClaimedSlotsForDay counts only
+  //    rows that already hold a slot for this day, so two racing processes
+  //    always compute the SAME next slot and exactly one wins the insert.
+  //
+  //    On a lost claim we do NOT retry with slot+1. A legitimate second post
+  //    of the day is picked up by the next hourly tick, which will count the
+  //    in-flight row and claim slot 1 naturally. Bumping the slot here would
+  //    recreate the duplicate this guard exists to prevent, at the cost of at
+  //    most one hour of latency for multi-post-per-day blogs.
+  //
+  //    Manual generation (isAutoGenerated false — the admin "Generate"
+  //    button) deliberately claims nothing: publish_day stays null, NULLs
+  //    never collide in a unique index, and an operator asking for an extra
+  //    post today still gets one. This guard exists to stop an accidentally
+  //    re-invoked cron, not a human.
+  const claimedAt = new Date();
+  const publishDay = utcDayKey(claimedAt);
+  let generatedPostId: string;
 
-  const generatedPostId = pending.id;
+  if (input.isAutoGenerated) {
+    const daySlot = await countClaimedSlotsForDay(blog.id, publishDay);
+    const [claimed] = await db
+      .insert(generatedPosts)
+      .values({
+        blogId: blog.id,
+        clientId: blog.clientId,
+        topic,
+        keywords,
+        primaryQuery,
+        supportingQueries,
+        status: "generating",
+        language: postLanguage,
+        isAutoGenerated: true,
+        publishDay,
+        daySlot,
+        createdAt: claimedAt,
+        updatedAt: claimedAt,
+      })
+      .onConflictDoNothing()
+      .returning({ id: generatedPosts.id });
+
+    if (!claimed) {
+      // Another process owns (blog, publishDay, daySlot). In practice this is
+      // a re-invoked cron shard racing a sweep that is still in flight. Hand
+      // the keyword target straight back to the pool — we never generated
+      // anything against it, so it keeps its priority position.
+      if (claimedTarget) {
+        await releaseKeywordTargetClaim(
+          claimedTarget.id,
+          `Publishing slot ${daySlot} for ${publishDay} was already claimed by another run`,
+        );
+      }
+      const message =
+        `slot ${daySlot} for ${publishDay} already claimed by another run — ` +
+        "skipping to avoid a duplicate post";
+      console.warn(`[auto-publish] ${blog.domain}: ${message}`);
+      recordPipelineError({
+        site: "auto-publish.claimSlot",
+        code: "PUBLISH_SLOT_CLAIM_LOST",
+        severity: "warn",
+        message: `${blog.domain}: ${message}`,
+        blogId: blog.id,
+        clientId: blog.clientId,
+        context: { domain: blog.domain, publishDay, daySlot },
+      });
+      return {
+        success: false,
+        generatedPostId: "",
+        status: "skipped",
+        transient: false,
+        message,
+      };
+    }
+    generatedPostId = claimed.id;
+  } else {
+    const [pending] = await db
+      .insert(generatedPosts)
+      .values({
+        blogId: blog.id,
+        clientId: blog.clientId,
+        topic,
+        keywords,
+        primaryQuery,
+        supportingQueries,
+        status: "generating",
+        language: postLanguage,
+        isAutoGenerated: false,
+      })
+      .returning({ id: generatedPosts.id });
+    generatedPostId = pending.id;
+  }
   // Attach the post id to the current telemetry frame so everything the
   // generator records below — truncation salvage, imageless, scrubber —
   // is joinable to this generated_posts row. No-op outside a cron run.
@@ -602,10 +823,15 @@ export async function runGenerateAndPublish(
     // 5. Generate content using the style profile loaded in step 2.
     //    Resolve vertical so the generator can pull recent news headlines
     //    as external-link sources for non-peptide posts.
-    //    Pre-fetch sibling posts on this blog so the generator can weave
-    //    internal links into the article (Stage 1 of the footprint audit
-    //    fixes — the single biggest SEO signal we were missing).
-    const internalLinkRefs = await getInternalLinkRefs(blog.id, 8);
+    //    Pre-fetch TOPICALLY-RELATED sibling posts on this blog so the
+    //    generator can weave internal links into the article. `let`, not
+    //    `const`: the topic-recovery loop below can swap the topic out, and the
+    //    link candidates have to follow it.
+    let internalLinkRefs = await getInternalLinkRefs(blog, {
+      topic,
+      keywords,
+      language: postLanguage,
+    });
     // Zero refs means the article will be generated with no internal-link
     // clause at all. Normal for a blog's first few posts; a persistent
     // fleet-wide rate means externalPostUrl is not being recorded, which
@@ -658,6 +884,8 @@ export async function runGenerateAndPublish(
       brandName: blog.brandName,
       internalLinkRefs,
       knowledgeSummaries: knowledge.summaries,
+      // Consumed by the article prompt in T05. Inert until then.
+      supportingQueries,
       localTarget: useLocalTarget ? localTarget : undefined,
       cta,
       // T02: the money link points at the client's real destination, not at
@@ -746,14 +974,32 @@ export async function runGenerateAndPublish(
             language: postLanguage,
             knowledge,
             customPrompt,
+            blogId: blog.id,
           },
         );
+        if (newIdea.exhausted) {
+          throw new Error(
+            "Re-ideation exhausted: every demand-validated candidate for this blog is already covered",
+          );
+        }
         if (!newIdea.topic || newIdea.topic.trim() === currentTopic.trim()) {
           throw new Error("Re-ideation returned an empty or duplicate topic");
         }
         currentTopic = newIdea.topic;
         currentKeywords =
           newIdea.keywords.length > 0 ? newIdea.keywords : currentKeywords;
+        // The recovery topic replaces the original subject entirely.
+        primaryQuery = newIdea.primaryQuery;
+        supportingQueries = newIdea.supportingQueries;
+        // The recovery attempt writes about something else, so the topical
+        // link candidates picked for the ABANDONED topic no longer apply.
+        // Costs one more embedding call on a path that is already re-running
+        // full article generation.
+        internalLinkRefs = await getInternalLinkRefs(blog, {
+          topic: currentTopic,
+          keywords: currentKeywords,
+          language: postLanguage,
+        });
         // Reflect the new topic on the pending row so the dashboard
         // shows what the recovery attempt is actually writing about.
         await db
@@ -761,6 +1007,8 @@ export async function runGenerateAndPublish(
           .set({
             topic: currentTopic,
             keywords: currentKeywords,
+            primaryQuery,
+            supportingQueries,
             updatedAt: new Date(),
           })
           .where(eq(generatedPosts.id, generatedPostId));
@@ -828,6 +1076,68 @@ export async function runGenerateAndPublish(
       report: content.scrubberReport,
     });
 
+    // 4b. THE GATE (T07). Until now shouldHoldForReview() had no caller: the
+    //     enforcement module, its mode switch and its tests all shipped, but
+    //     nothing in either publish path consulted it, so SCRUBBER_ENFORCEMENT
+    //     =enforce changed nothing except one word in the log line above.
+    //     This is the call that makes the verdict actually gate publishing.
+    //
+    //     The row is parked as 'generated' — "the article exists, it is not
+    //     live" — and NOT 'publishing'/'published'. That choice is load-
+    //     bearing for T08: 'generated' sits outside the
+    //     generated_posts_blog_day_slot_uniq predicate, so a held post
+    //     releases its day slot instead of silently blocking the blog from
+    //     publishing anything until midnight UTC. flaggedForReview is already
+    //     true on the row (written in the update above), which is what the
+    //     review queue filters on.
+    if (shouldHoldForReview(content.flaggedForReview ?? false)) {
+      const summary = scrubberSummary(content.scrubberReport);
+      const heldMessage = `${SCRUBBER_HOLD_PREFIX} ${summary}`;
+      await db
+        .update(generatedPosts)
+        .set({
+          status: "generated",
+          failureReason: heldMessage,
+          updatedAt: new Date(),
+        })
+        .where(eq(generatedPosts.id, generatedPostId));
+
+      // The article never went live, so the claimed keyword was not covered.
+      // Same treatment as the publish-failure path below. (Both currently
+      // land the ledger row in a terminal 'failed' state — that is the
+      // draining bug T10 owns; this path deliberately does not diverge from
+      // its neighbour ahead of that fix.)
+      if (claimedTarget) {
+        await markKeywordTargetFailed(claimedTarget.id, heldMessage);
+      }
+
+      recordPipelineError({
+        site: "auto-publish.scrubberGate",
+        code: "SCRUBBER_PUBLISH_HELD",
+        severity: "warn",
+        message: `${blog.domain}: ${heldMessage}`,
+        blogId: blog.id,
+        clientId: blog.clientId,
+        postId: generatedPostId,
+        context: {
+          domain: blog.domain,
+          verdict: content.scrubberVerdict ?? null,
+          strictness: styleProfile?.scrubberStrictness ?? null,
+        },
+      });
+      bumpCounter("scrubberHeld");
+
+      return {
+        success: false,
+        generatedPostId,
+        status: "generated",
+        // A scrubber rejection is deterministic — the same prompt would
+        // produce another flagged draft. Never retry it inside the tick.
+        transient: false,
+        message: heldMessage,
+      };
+    }
+
     // 5. Publish via platform-client (handles WP + Shopify)
     const platformBlog: PlatformBlog = {
       platform: blog.platform,
@@ -879,6 +1189,12 @@ export async function runGenerateAndPublish(
         success: false,
         generatedPostId,
         status: "generated",
+        // The article exists and only the platform call failed. Flagged so
+        // the caller can log it, but publishOneInner deliberately does NOT
+        // regenerate on this — that would pay for the article twice and
+        // orphan the first draft. The draft can be pushed later with
+        // blog-actions.publishGeneratedPost().
+        transient: isTransientFailure(publish.message),
         message: `Generated but publish failed: ${publish.message}`,
       };
     }
@@ -907,16 +1223,28 @@ export async function runGenerateAndPublish(
         },
       });
     }
+    // What the LIVE page actually rendered after the meta write (T14).
+    // null means "could not check" — Shopify, or the page was unreachable.
+    const seoMetaVerified = publish.seoMetaVerified ?? null;
     await db
       .update(generatedPosts)
       .set({
         status: "published",
         externalPostId: publish.postId != null ? String(publish.postId) : null,
         externalPostUrl: publish.postUrl ?? null,
+        seoMetaVerified,
+        seoMetaVerifiedAt: seoMetaVerified === null ? null : publishedAt,
         publishedAt,
         updatedAt: publishedAt,
       })
       .where(eq(generatedPosts.id, generatedPostId));
+
+    if (seoMetaVerified === false) {
+      console.error(
+        `[auto-publish] SEO META NOT LIVE for ${blog.domain} post ` +
+          `${publish.postId} (${publish.postUrl}): ${publish.seoMetaMessage ?? "no detail"}`,
+      );
+    }
 
     await db
       .update(blogs)
@@ -930,20 +1258,39 @@ export async function runGenerateAndPublish(
     // 7. Push notification — IndexNow ping covers Bing, Yandex, Seznam,
     //    Naver, Yep, and DuckDuckGo in one POST. Fire-and-forget: the
     //    publish has already succeeded, so a slow/failed engine ping must
-    //    not roll back or delay anything. No-op when INDEXNOW_KEY is unset.
-    //    The first publish per blog also auto-deploys the IndexNow key
-    //    file to the blog's domain via the platform's API (WP REST media
-    //    upload / Shopify Pages create) — no manual setup required.
-    //    Subsequent publishes hit an in-memory cache.
-    //    Google has no IndexNow equivalent and discovers posts via its
-    //    natural sitemap crawl (Yoast/RankMath/Shopify defaults).
+    //    not roll back or delay anything.
+    //    The first publish per blog also deploys the blog's OWN IndexNow key
+    //    to the document root via the NetGrid MU-plugin, and verifies the
+    //    file is actually served before pinging (T15). Subsequent publishes
+    //    hit a TTL cache. Shopify is sitemap-only and records a "skipped"
+    //    event — see docs/indexnow/README.md.
+    //    Google is NOT covered here: it has never supported IndexNow and its
+    //    unauthenticated sitemap ping was retired in 2023. The Google path is
+    //    Search Console sitemap submission (indexing-onboarding.ts).
     if (publish.postUrl) {
-      pingIndexNowFireAndForget(blog, publish.postUrl);
+      pingIndexNowFireAndForget(blog, publish.postUrl, generatedPostId);
     }
 
     // Per-post SEO scan — audit this specific page now that it's live.
     // Fire-and-forget so it never delays or fails the auto-publish run.
     scanPostAfterPublishFireAndForget(generatedPostId);
+
+    // 7b. Semantic linking — embed this post, inject its "Related posts" block
+    //     (Shopify: the custom.netgrid_related_posts metafield; WordPress: an
+    //     idempotent in-body block), then refresh its top neighbours so the NEW
+    //     post appears in THEIR related lists too. That backward+forward pair
+    //     is what keeps the internal link graph bidirectional; without it a
+    //     cron-published post waited for the hourly backfill and its older
+    //     siblings never linked forward at all — and the cron IS the dominant
+    //     publish path, so lane B effectively never fired in production.
+    //
+    //     Must come after the row is stamped status='published' with its
+    //     external ids above: applyRelatedLinks bails with "Post is not live"
+    //     otherwise.
+    //
+    //     Fire-and-forget and internally try/caught; no-op when
+    //     OPENAI_API_KEY is unset or SEMANTIC_LINK_ON_PUBLISH=0.
+    relinkAfterPublishFireAndForget(generatedPostId);
 
     // Local keyword-targeted content: the ledger row is 'generated' only
     // when the LIVE post actually targeted the claimed keyword (attempt 1
@@ -960,10 +1307,25 @@ export async function runGenerateAndPublish(
       }
     }
 
+    // Permanent coverage record. Written only after the post is LIVE, so a
+    // failed generation or publish leaves the query in the pool for a future
+    // run. Never throws — see recordCoveredQuery.
+    if (primaryQuery) {
+      await recordCoveredQuery({
+        blogId: blog.id,
+        clientId: blog.clientId,
+        query: primaryQuery,
+        topic: content.title || topic,
+        generatedPostId,
+        source: claimedTarget ? "ledger" : "ideation",
+      });
+    }
+
     return {
       success: true,
       generatedPostId,
       status: "published",
+      transient: false,
       externalPostId: publish.postId,
       externalPostUrl: publish.postUrl,
       message: `Published "${content.title}" to ${blog.domain}`,
@@ -987,6 +1349,10 @@ export async function runGenerateAndPublish(
       success: false,
       generatedPostId,
       status: "failed",
+      // This is THE return site the worker pool's retry could never see:
+      // everything from the pending insert onward is inside the try this
+      // catch closes, so an Anthropic 429 lands here as a value, not a throw.
+      transient: isTransientFailure(message),
       message,
     };
   }
@@ -1046,7 +1412,14 @@ export async function regenerateAndUpdatePost(
   }
 
   const keywords = Array.isArray(post.keywords) ? (post.keywords as string[]) : [];
-  const internalLinkRefs = await getInternalLinkRefs(blog.id, 8);
+  // excludePostId: this post is published with a live URL (guard above), so
+  // without it the regenerated body could link to itself.
+  const internalLinkRefs = await getInternalLinkRefs(blog, {
+    topic: post.topic,
+    keywords,
+    language: (post.language as "en" | "fr" | null) ?? ctx.language,
+    excludePostId: post.id,
+  });
   await loadNicheProfiles(); // generated niche context for getNicheContext()
 
   const content = await generateContent({
@@ -1124,6 +1497,9 @@ export async function regenerateAndUpdatePost(
     success: true,
     generatedPostId: post.id,
     status: "published",
+    // In-place regeneration of an already-live post. It never creates a new
+    // row and never claims a day slot, so it has no transient path.
+    transient: false,
     externalPostId: post.externalPostId,
     externalPostUrl: post.externalPostUrl ?? undefined,
     message: `Regenerated and updated the live post on ${blog.domain}`,
@@ -1210,13 +1586,21 @@ export async function suggestTopicForBlog(
   await requireAdmin();
   const ctx = await resolveIdeationContext(blogId);
   const recentTitles = await getRecentTitles(blogId, ctx.blog.clientId);
-  return ideateTopic(ctx.clientNiche, recentTitles, {
+  const ideated = await ideateTopic(ctx.clientNiche, recentTitles, {
     verticalKey: ctx.verticalKey,
     styleProfile: ctx.styleProfile ?? undefined,
     language: ctx.language,
     knowledge: ctx.knowledge,
     customPrompt: ctx.customPrompt,
+    blogId,
   });
+  if (ideated.exhausted) {
+    // GeneratePostButton catches and toasts e.message — no component change.
+    throw new Error(
+      "Every demand-validated query for this blog is already covered. Refresh the client's keyword pool, then try again.",
+    );
+  }
+  return { topic: ideated.topic, keywords: ideated.keywords };
 }
 
 /**
@@ -1236,6 +1620,124 @@ export async function suggestKeywordsForBlog(
   });
 }
 
+export interface ReapResult {
+  /** Rows released from 'generating' (nothing was sent to the platform). */
+  generating: number;
+  /** Rows released from 'publishing' (platform outcome unknown). */
+  publishing: number;
+  /** blog_keyword_targets rows returned to the pool. */
+  keywordTargets: number;
+  thresholdMinutes: number;
+}
+
+/**
+ * Release rows abandoned mid-flight by a process that died (T08).
+ *
+ * A publish walks generated_posts.status through 'generating' →
+ * 'publishing' → 'published', stamping updated_at at every transition.
+ * Nothing legitimately stays in flight for long: a post takes ~25-35s
+ * end-to-end and the route driving it is capped at maxDuration = 600s. The
+ * default 30-minute threshold is 3x the longest possible legitimate lifetime.
+ *
+ * Rows only exceed it when the process is gone — a Render restart, a deploy
+ * mid-run, an OOM, or the function hitting its deadline. Before T08 those
+ * orphans were cosmetic because the due-check ignored in-flight rows
+ * entirely. Now they HOLD the blog's day slot, so an unreaped row would block
+ * that blog from publishing until midnight UTC. This is a prerequisite for
+ * the guard, not hygiene.
+ *
+ * Idempotent and safe to run from all four shards concurrently: each
+ * statement re-tests the age, so a row can only be reaped once.
+ */
+export async function reapStuckPublishes(
+  thresholdMinutes = Number(process.env.PUBLISH_REAPER_MINUTES || "30"),
+): Promise<ReapResult> {
+  const cutoff = new Date(Date.now() - thresholdMinutes * 60_000);
+  const now = new Date();
+
+  // 'generating': nothing has been sent to the platform yet, so this is an
+  // unambiguous failure. Safe to mark failed outright.
+  const reapedGenerating = await db
+    .update(generatedPosts)
+    .set({
+      status: "failed",
+      failureReason: `Reaped after ${thresholdMinutes}m stuck in 'generating' (process restart or deploy mid-run)`,
+      updatedAt: now,
+    })
+    .where(
+      and(
+        eq(generatedPosts.status, "generating"),
+        lt(generatedPosts.updatedAt, cutoff),
+      ),
+    )
+    .returning({ id: generatedPosts.id });
+
+  // 'publishing': the article body is already persisted and the platform call
+  // may or may not have landed before the process died. Park it as
+  // 'generated' — "content exists, not live as far as we know" — rather than
+  // 'failed'. That frees the day slot, keeps the draft publishable via
+  // blog-actions.publishGeneratedPost, and does not assert an outcome we
+  // cannot observe. It is the same status the ordinary publish-failure path
+  // uses, so the dashboard already knows how to render it.
+  //
+  // Residual risk, accepted knowingly: if the process died in the few seconds
+  // after WordPress/Shopify accepted the article but before the status
+  // update, the post is live and netgrid does not know. Freeing the slot then
+  // allows a second post that day. That is strictly rarer than the failure
+  // mode this guards against (seconds on a process death, versus minutes on
+  // every timeout), and the post-verification cron reconciles live posts back
+  // into the record. Leaving 'publishing' rows in place would trade a rare
+  // duplicate for a guaranteed permanent block on the blog.
+  const reapedPublishing = await db
+    .update(generatedPosts)
+    .set({
+      status: "generated",
+      failureReason: `Reaped after ${thresholdMinutes}m stuck in 'publishing' — platform outcome unknown, verify the live site before re-publishing`,
+      updatedAt: now,
+    })
+    .where(
+      and(
+        eq(generatedPosts.status, "publishing"),
+        lt(generatedPosts.updatedAt, cutoff),
+      ),
+    )
+    .returning({ id: generatedPosts.id });
+
+  // The keyword ledger's own orphans. See T10 for the broader ledger work.
+  const keywordTargets = await releaseStuckKeywordTargets();
+
+  if (
+    reapedGenerating.length > 0 ||
+    reapedPublishing.length > 0 ||
+    keywordTargets > 0
+  ) {
+    console.warn(
+      `[auto-publish] reaper: released ${reapedGenerating.length} 'generating' + ` +
+        `${reapedPublishing.length} 'publishing' post row(s) and ` +
+        `${keywordTargets} keyword target(s) older than ${thresholdMinutes}m`,
+    );
+    recordPipelineError({
+      site: "auto-publish.reaper",
+      code: "PUBLISH_ROWS_REAPED",
+      severity: "warn",
+      message: `Reaped ${reapedGenerating.length} generating + ${reapedPublishing.length} publishing row(s) and ${keywordTargets} keyword target(s)`,
+      context: {
+        generating: reapedGenerating.length,
+        publishing: reapedPublishing.length,
+        keywordTargets,
+        thresholdMinutes,
+      },
+    });
+  }
+
+  return {
+    generating: reapedGenerating.length,
+    publishing: reapedPublishing.length,
+    keywordTargets,
+    thresholdMinutes,
+  };
+}
+
 export interface AutoPublishResult {
   considered: number;
   /** Total active blogs in DB before shard filter (when sharded). */
@@ -1248,14 +1750,40 @@ export interface AutoPublishResult {
   published: number;
   failed: number;
   skipped: number;
+  /**
+   * Blogs whose UTC-day publishing slot was already claimed by another
+   * process — the idempotency guard firing (T08). Included in `skipped`.
+   * Should be 0 in steady state; anything above 0 means a shard was invoked
+   * twice, so alert on it.
+   */
+  claimLost: number;
+  /** In-flight rows released at the start of this sweep. */
+  reaped: ReapResult;
   deferred: number; // due but capped this run; will run next cron tick
+  /**
+   * Active blogs — network-wide, NOT shard-filtered — whose posting_plan is
+   * empty. These can never publish and are excluded from the candidate query
+   * entirely. This is a configuration fault, surfaced as a critical item in
+   * /api/notifications and as an activity_log row written by shard 0.
+   */
+  unscheduledActiveBlogs: number;
+  /** Domains of those blogs, capped at 25 so the log line stays readable. */
+  unscheduledDomains: string[];
+  /** True when ?dry=1 was passed: the queue was built but nothing published. */
+  dryRun: boolean;
   currentHourUtc: number;
   maxPerRun: number;
   results: Array<{
     blogId: string;
     domain: string;
     preferredHour: number;
-    status: "published" | "generated" | "failed" | "skipped" | "deferred";
+    status:
+      | "published"
+      | "generated"
+      | "failed"
+      | "skipped"
+      | "deferred"
+      | "dry_run";
     message: string;
   }>;
   /**
@@ -1278,8 +1806,8 @@ export interface AutoPublishResult {
  *   1. Load all active blogs with cadence configured, joined to client.
  *   2. For each blog, determine eligibility:
  *        a. Client total-posts cap (clients.totalBlogsTarget)
- *        b. Cadence: today's weekday is in postingFrequencyDays AND not
- *           already published today
+ *        b. Cadence: today's entry in blogs.posting_plan is non-zero AND
+ *           today's published count is below it (see isBlogDueForPost)
  *        c. Time-of-day slot: current UTC hour ≥ preferredHourForBlog(blogId).
  *           This spreads publishes naturally across the day — a blog whose
  *           slot is 09:00 UTC waits until the cron sees hour 9, then is
@@ -1307,16 +1835,47 @@ function resolveShard(opts: { shardIndex?: number; shardCount?: number }): {
   shardIndex: number;
   shardCount: number;
 } {
-  const shardCount =
-    Number.isInteger(opts.shardCount) && opts.shardCount! > 0
-      ? opts.shardCount!
-      : 1;
-  const shardIndex =
-    Number.isInteger(opts.shardIndex) &&
-    opts.shardIndex! >= 0 &&
-    opts.shardIndex! < shardCount
-      ? opts.shardIndex!
-      : 0;
+  // THROW on anything malformed instead of defaulting (T08).
+  //
+  // The old code silently coerced a bad value to shardIndex 0 / shardCount 1.
+  // Because these arrive from a query string baked into each cron service's
+  // CRON_PATH env var, a single mistyped character had two silent failure
+  // modes, both of which double-publish:
+  //
+  //   "?shrad=0&shardCount=4" → index 0, count 4 → this service duplicates
+  //                             the real shard-0 service: a quarter of the
+  //                             network published twice every hour.
+  //   "?shard=o&shardCount=4" → count falls back to 1 → the shard filter
+  //                             becomes a no-op and this ONE service
+  //                             publishes the ENTIRE network, on top of all
+  //                             four real shards.
+  //
+  // Neither showed up in the response body or the logs (the shard diagnostic
+  // is suppressed when shardCount <= 1, so the worse case was the quieter
+  // one). The route validates these too and answers 400; this throw is the
+  // defence in depth for any other caller.
+  if ((opts.shardIndex === undefined) !== (opts.shardCount === undefined)) {
+    throw new Error(
+      "auto-publish sharding: shardIndex and shardCount must be supplied together " +
+        `(got shardIndex=${String(opts.shardIndex)}, shardCount=${String(opts.shardCount)})`,
+    );
+  }
+  const shardCount = opts.shardCount ?? 1;
+  const shardIndex = opts.shardIndex ?? 0;
+  if (!Number.isInteger(shardCount) || shardCount < 1) {
+    throw new Error(
+      `auto-publish sharding: shardCount must be an integer >= 1, got ${String(opts.shardCount)}`,
+    );
+  }
+  if (
+    !Number.isInteger(shardIndex) ||
+    shardIndex < 0 ||
+    shardIndex >= shardCount
+  ) {
+    throw new Error(
+      `auto-publish sharding: shardIndex must be an integer in [0, ${shardCount - 1}], got ${String(opts.shardIndex)}`,
+    );
+  }
   return { shardIndex, shardCount };
 }
 
@@ -1326,6 +1885,12 @@ export async function runAutoPublishCron(
     shardIndex?: number;
     /** Total number of parallel cron services. Default 1 = no sharding. */
     shardCount?: number;
+    /**
+     * Build the eligibility queue and return it WITHOUT publishing anything.
+     * Used to inspect cadence decisions safely (T17 SOP section 8.3).
+     * Reached via /api/cron/auto-publish?dry=1.
+     */
+    dryRun?: boolean;
   } = {},
 ): Promise<AutoPublishResult> {
   const { shardIndex, shardCount } = resolveShard(opts);
@@ -1342,16 +1907,24 @@ export async function runAutoPublishCron(
 }
 
 async function runAutoPublishCronInner(
-  opts: { shardIndex?: number; shardCount?: number } = {},
+  opts: { shardIndex?: number; shardCount?: number; dryRun?: boolean } = {},
 ): Promise<AutoPublishResult> {
   const now = new Date();
   const todayStart = startOfUtcDay(now);
+  const todayKey = utcDayKey(now);
   const currentHour = now.getUTCHours();
   const { shardIndex, shardCount } = resolveShard(opts);
 
-  // 1. Active blogs with at least one cadence field set. Sort at the DB
-  //    layer by lastPostVerifiedAt ASC NULLS FIRST so we can stream
-  //    longest-waiting first without an in-memory sort pass.
+  // 0. Release anything stuck in flight from a previous run BEFORE counting.
+  //    An in-flight row now holds the blog's day slot, so counting first
+  //    would skip that blog for the rest of the UTC day.
+  const reaped = await reapStuckPublishes();
+
+  // 1. Active blogs that have a real schedule. Blogs with an empty
+  //    posting_plan are EXCLUDED here rather than loaded and skipped every
+  //    hour — they are counted and alerted on separately below.
+  //    Sort at the DB layer by lastPostVerifiedAt ASC NULLS FIRST so we can
+  //    stream longest-waiting first without an in-memory sort pass.
   const rows = await db
     .select({
       blog: blogs,
@@ -1370,13 +1943,51 @@ async function runAutoPublishCronInner(
         // the day it deployed (Aug 31). Onboarding clients have always
         // published; paused is the only exclusion.
         ne(clients.status, "paused"),
-        or(isNotNull(blogs.postingFrequency), isNotNull(blogs.postingFrequencyDays)),
+        sql`${blogs.postingPlan} <> '{0,0,0,0,0,0,0}'::integer[]`,
       ),
     )
     .orderBy(
       sql`${blogs.lastPostVerifiedAt} ASC NULLS FIRST`,
       asc(blogs.id),
     );
+
+  // 1b. The alertable condition: active blogs that can never publish.
+  //     Network-wide on purpose — this is a configuration fault, not a
+  //     per-shard workload figure. Uses the blogs_unscheduled_idx partial
+  //     index added by 0043_posting_plan.sql. Paused clients are excluded
+  //     for the same reason they are excluded above: their blogs are not
+  //     meant to be publishing, so an empty plan there is not a fault.
+  const unscheduledRows = await db
+    .select({ id: blogs.id, domain: blogs.domain })
+    .from(blogs)
+    .innerJoin(clients, eq(blogs.clientId, clients.id))
+    .where(
+      and(
+        eq(blogs.status, "active"),
+        ne(clients.status, "paused"),
+        sql`${blogs.postingPlan} = '{0,0,0,0,0,0,0}'::integer[]`,
+      ),
+    )
+    .orderBy(asc(blogs.domain));
+
+  // Only shard 0 reports, so four hourly cron services don't quadruple the
+  // log noise and the activity_log rows.
+  if (shardIndex === 0 && unscheduledRows.length > 0) {
+    const domains = unscheduledRows.map((r) => r.domain);
+    console.warn(
+      `[auto-publish][ALERT] ${unscheduledRows.length} active blog(s) have no ` +
+        `posting plan and will never publish: ${domains.slice(0, 25).join(", ")}` +
+        (domains.length > 25 ? `, +${domains.length - 25} more` : ""),
+    );
+    await logActivity({
+      action: "auto_publish_unscheduled",
+      entityType: "blog",
+      details: {
+        count: unscheduledRows.length,
+        domains: domains.slice(0, 50),
+      },
+    });
+  }
 
   // 2. Per-client + per-blog usage counters.
   const clientCounts = await db
@@ -1389,6 +2000,25 @@ async function runAutoPublishCronInner(
     .groupBy(generatedPosts.clientId);
   const publishedByClient = new Map(clientCounts.map((r) => [r.clientId, r.n]));
 
+  // Per-blog "posts that occupy today" count. This drives isBlogDueForPost
+  // below, so what it counts decides whether a blog publishes again today.
+  //
+  // It MUST include in-flight rows (T08). The old version filtered on
+  // status='published' AND published_at >= todayStart; a post another sweep
+  // is mid-way through writing is 'generating' or 'publishing' with a NULL
+  // published_at, so it failed BOTH predicates and the blog looked due again.
+  // That is the double-post.
+  //
+  // Two arms, because a row can carry its day either way:
+  //   publish_day = today — an auto-publish claim (set at insert time, so it
+  //                         is visible from the first millisecond of the run,
+  //                         long before published_at exists).
+  //   publish_day IS NULL — a manual post from the admin UI, plus every
+  //                         pre-T08 row. Those are only countable through
+  //                         published_at, exactly as before.
+  //
+  // 'generated' and 'failed' stay excluded: a run that failed, or wrote an
+  // article the platform refused, has not used up the blog's day.
   const blogCountsToday = await db
     .select({
       blogId: generatedPosts.blogId,
@@ -1397,8 +2027,14 @@ async function runAutoPublishCronInner(
     .from(generatedPosts)
     .where(
       and(
-        eq(generatedPosts.status, "published"),
-        gte(generatedPosts.publishedAt, todayStart),
+        inArray(generatedPosts.status, ["generating", "publishing", "published"]),
+        or(
+          eq(generatedPosts.publishDay, todayKey),
+          and(
+            isNull(generatedPosts.publishDay),
+            gte(generatedPosts.publishedAt, todayStart),
+          ),
+        ),
       ),
     )
     .groupBy(generatedPosts.blogId);
@@ -1546,11 +2182,25 @@ async function runAutoPublishCronInner(
   //    Anything beyond MAX_BLOGS_PER_CRON_RUN is "deferred" — those
   //    blogs become eligible again on the next cron tick.
   queue.sort((a, b) => {
-    // Oldest real-publish first (null = never published → goes first).
-    // Uses our publish history, not the verification timestamp.
-    const aLast = a.lastPublishedAt?.getTime() ?? 0;
-    const bLast = b.lastPublishedAt?.getTime() ?? 0;
-    if (aLast !== bLast) return aLast - bLast;
+    // 1. Oldest publish DAY first (null = never published → goes first).
+    //    Bucketing to the UTC day rather than the exact timestamp is what
+    //    makes the runway tie-break below actually fire: two blogs that
+    //    both last published "on Tuesday" now compare equal here.
+    const aDay = a.lastPublishedAt
+      ? startOfUtcDay(a.lastPublishedAt).getTime()
+      : 0;
+    const bDay = b.lastPublishedAt
+      ? startOfUtcDay(b.lastPublishedAt).getTime()
+      : 0;
+    if (aDay !== bDay) return aDay - bDay;
+    // 2. Least runway left today first. A blog whose slot is 17h has one
+    //    tick before the UTC day rolls over and its scheduled day is gone
+    //    (strict day-only cadence, no catch-up); a blog whose slot is 2h
+    //    has fifteen. Highest preferred hour therefore goes first.
+    if (a.preferredHour !== b.preferredHour) {
+      return b.preferredHour - a.preferredHour;
+    }
+    // 3. Stable tie-break.
     return a.blog.id.localeCompare(b.blog.id);
   });
   const toRun = queue.slice(0, MAX_BLOGS_PER_CRON_RUN);
@@ -1579,6 +2229,41 @@ async function runAutoPublishCronInner(
     );
   }
 
+  // 4b. Dry run: report what WOULD happen and stop. Nothing is generated,
+  //     nothing is published, no counters move.
+  if (opts.dryRun) {
+    for (const entry of toRun) {
+      results.push({
+        blogId: entry.blog.id,
+        domain: entry.blog.domain,
+        preferredHour: entry.preferredHour,
+        status: "dry_run",
+        message: `would publish (plan ${formatPostingPlan(
+          normalizePostingPlan(entry.blog.postingPlan),
+        )}, slot ${entry.preferredHour}h UTC)`,
+      });
+    }
+    return {
+      considered: shardCount > 1 ? shardFilteredRows.length : rows.length,
+      ...(shardCount > 1
+        ? { totalActiveBlogs: rows.length, shardIndex, shardCount }
+        : {}),
+      due: queue.length,
+      published: 0,
+      failed: 0,
+      skipped,
+      claimLost: 0,
+      reaped,
+      deferred: deferredQueue.length,
+      unscheduledActiveBlogs: unscheduledRows.length,
+      unscheduledDomains: unscheduledRows.slice(0, 25).map((r) => r.domain),
+      dryRun: true,
+      currentHourUtc: currentHour,
+      maxPerRun: MAX_BLOGS_PER_CRON_RUN,
+      results,
+    };
+  }
+
   // 5. Process the run queue with a concurrency-capped worker pool.
   //
   //    Default 3 concurrent publishes per cron tick. With 4 shards
@@ -1599,6 +2284,8 @@ async function runAutoPublishCronInner(
   //    even with parallel workers.
   let published = 0;
   let failed = 0;
+  // Counts the idempotency guard firing (T08). Also folded into `skipped`.
+  let claimLost = 0;
 
   const concurrency = Math.max(
     1,
@@ -1623,11 +2310,20 @@ async function runAutoPublishCronInner(
   async function publishOneInner(entry: QueueEntry): Promise<void> {
     const { blog, todayCount, clientCount, preferredHour } = entry;
     let lastError: unknown = null;
+    let lastMessage = "Unknown error";
 
     // Up to 2 attempts. Sleep 8s between them so a transient Anthropic
     // 429 has time to release budget. The publish action itself has
     // internal retries against Anthropic/Google, so this is the
     // outermost belt + suspenders.
+    //
+    // The retry decision reads BOTH channels, and that is the whole point
+    // (T08): runGenerateAndPublish catches its own errors from the pending
+    // insert onward and RETURNS { status: "failed", transient }. Only the
+    // pre-flight section (blog lookup, credentials, ideation, the claim
+    // insert) can throw. The old code inspected thrown errors only, so the
+    // dominant failure class — an Anthropic 429 during generation — never
+    // retried at all.
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
         if (attempt > 1) {
@@ -1637,6 +2333,21 @@ async function runAutoPublishCronInner(
           blogId: blog.id,
           isAutoGenerated: true,
         });
+
+        // Retry only a transient HARD failure. A "generated" result means the
+        // article exists and only the platform call failed — regenerating
+        // would pay Anthropic and Google twice and orphan the first draft, so
+        // it is left for blog-actions.publishGeneratedPost. A "skipped"
+        // result means another run owns the slot; retrying would just lose
+        // the race again.
+        if (result.status === "failed" && result.transient && attempt < 2) {
+          lastMessage = result.message;
+          console.warn(
+            `[auto-publish] transient failure for ${blog.domain}, retrying in 8s: ${result.message.slice(0, 200)}`,
+          );
+          continue;
+        }
+
         results.push({
           blogId: blog.id,
           domain: blog.domain,
@@ -1648,32 +2359,26 @@ async function runAutoPublishCronInner(
           published++;
           publishedTodayByBlog.set(blog.id, todayCount + 1);
           publishedByClient.set(blog.clientId, clientCount + 1);
+        } else if (result.status === "skipped") {
+          // Lost the day-slot claim: another process is already publishing
+          // for this blog today. Not a failure — the guard did its job.
+          skipped++;
+          claimLost++;
         } else {
           failed++;
         }
         return;
       } catch (error) {
+        // Thrown errors can only come from the pre-flight section. Same
+        // classifier, so behaviour for those is unchanged.
         lastError = error;
-        const msg = error instanceof Error ? error.message.toLowerCase() : "";
-        // Non-transient errors (auth, validation, bad config) — give up
-        // immediately so we don't waste a retry slot.
-        const isTransient =
-          msg.includes("rate limit") ||
-          msg.includes("429") ||
-          msg.includes("503") ||
-          msg.includes("504") ||
-          msg.includes("timeout") ||
-          msg.includes("etimedout") ||
-          msg.includes("econnreset") ||
-          msg.includes("network") ||
-          msg.includes("overloaded");
-        if (!isTransient) break;
+        lastMessage = error instanceof Error ? error.message : "Unknown error";
+        if (!isTransientFailure(lastMessage)) break;
       }
     }
 
     failed++;
-    const message =
-      lastError instanceof Error ? lastError.message : "Unknown error";
+    const message = lastMessage;
     recordPipelineError({
       site: "auto-publish.publishOne",
       code: "PUBLISH_ATTEMPT_FAILED",
@@ -1721,6 +2426,7 @@ async function runAutoPublishCronInner(
   setCounter("failed", failed);
   setCounter("skipped", skipped);
   setCounter("deferred", deferredQueue.length);
+  setCounter("claimLost", claimLost);
 
   return {
     // When sharded, "considered" is the count this shard saw after
@@ -1737,7 +2443,12 @@ async function runAutoPublishCronInner(
     published,
     failed,
     skipped,
+    claimLost,
+    reaped,
     deferred: deferredQueue.length,
+    unscheduledActiveBlogs: unscheduledRows.length,
+    unscheduledDomains: unscheduledRows.slice(0, 25).map((r) => r.domain),
+    dryRun: false,
     currentHourUtc: currentHour,
     maxPerRun: MAX_BLOGS_PER_CRON_RUN,
     results,

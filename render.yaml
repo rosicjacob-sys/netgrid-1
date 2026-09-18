@@ -42,6 +42,48 @@ services:
       # there, not in the cron container, and the two have separate env sets.
       - key: ALERT_EMAIL_TO
         sync: false
+      # ── Keyword pipeline (T10) ────────────────────────────────────────
+      # All optional; the values shown are the in-code defaults unless noted.
+      # Sized for a ~1,500-client / ~1,500-active-city-blog network — re-derive
+      # them if that changes materially.
+      #
+      # Clients one shard scrapes per hourly run. The time budget below
+      # normally binds first (~12 clients at 210 s); this is the safety net.
+      - key: KEYWORD_REFRESH_MAX_CLIENTS
+        value: "15"
+      # Wall-clock budget for the scrape phase, ms. Leave headroom for the
+      # rebuild phase inside CRON_MAX_TIME (660 s).
+      - key: KEYWORD_REFRESH_TIME_BUDGET_MS
+        value: "210000"
+      # A client is only a candidate once its last ATTEMPT is this old. This is
+      # the real cadence control — the cron schedule just supplies slots.
+      - key: KEYWORD_REFRESH_MIN_AGE_HOURS
+        value: "144"
+      # HTTP requests per scrapeKeywords() call, per locale. 12 seeds x 27
+      # queries = 324 uncapped; 160 halves both wall clock and block risk.
+      - key: KEYWORD_SCRAPE_MAX_QUERIES
+        value: "160"
+      # Parallel suggest requests inside ONE scrape. 3, not the code default of
+      # 6: this is the peak request rate against Google from the single Render
+      # egress IP. If activity_log starts showing keywords.scrape_blocked,
+      # halve this FIRST, then halve KEYWORD_REFRESH_MAX_CLIENTS.
+      - key: KEYWORD_SCRAPE_CONCURRENCY
+        value: "3"
+      # Ledger rebuild bounds, per run.
+      - key: KEYWORD_REBUILD_MAX_BLOGS
+        value: "400"
+      - key: KEYWORD_REBUILD_TIME_BUDGET_MS
+        value: "120000"
+      # Ledger retry lifecycle. attempts >= MAX dead-letters the row to
+      # 'failed'; RETRY_DELAY_HOURS is the cool-off before a requeued row is
+      # claimable; STUCK_MINUTES is the reaper window for rows stranded in
+      # 'generating' with no post attached.
+      - key: KEYWORD_TARGET_MAX_ATTEMPTS
+        value: "3"
+      - key: KEYWORD_TARGET_RETRY_DELAY_HOURS
+        value: "6"
+      - key: KEYWORD_TARGET_STUCK_MINUTES
+        value: "90"
       - key: ALERT_SUPPRESS_HOURS
         value: "6"
       # Article-generation output-token budget (T06). Both optional — the code
@@ -72,8 +114,12 @@ services:
         sync: false
       # Semantic linking (cosine-similarity related posts). OPENAI_API_KEY
       # powers the text-embedding-3-small vectors; SHOPIFY_WEBHOOK_SECRET
-      # verifies articles/create|update webhooks. Threshold/max are optional
-      # (defaults 0.75 / 5).
+      # verifies articles/create|update webhooks. Every SEMANTIC_LINK_* knob is
+      # optional and read by the Next.js process, so they belong HERE, on the
+      # web service — a cron service's env vars are consumed by curl in the
+      # cron container and never reach the handler.
+      # Defaults: THRESHOLD 0.55 (on the blended hybrid scale, NOT a pure
+      # cosine cutoff), MAX 5, ALPHA 0.3.
       - key: OPENAI_API_KEY
         sync: false
       - key: SHOPIFY_WEBHOOK_SECRET
@@ -84,6 +130,29 @@ services:
         sync: false
       # Hybrid dense+sparse blend weight (sparse share). Default 0.3.
       - key: SEMANTIC_LINK_ALPHA
+        sync: false
+      # ── Internal linking (T16) ────────────────────────────────────────
+      # Kill switch for the publish-time relink hook, which now fires on the
+      # auto-publish cron as well as the two manual paths. "0" disables all
+      # three without a deploy and leaves the backfill cron as the only writer.
+      - key: SEMANTIC_LINK_ON_PUBLISH
+        sync: false
+      # Topic ideation grounding (T11). Unset/false: a client with no scraped
+      # keyword pool falls back to ungrounded invention so it keeps publishing.
+      # "true": ideation refuses instead, and no post is ever published against
+      # a query nobody searches for. Flip this once grounding coverage is high
+      # (the monitoring queries are in docs/remediation-status.md).
+      - key: IDEATION_REQUIRE_CANDIDATES
+        sync: false
+      # Share of a backfill run's budget reserved for RE-linking posts whose
+      # neighbourhood has changed since they were last linked. Default 0.6.
+      # The rest goes to never-linked posts; unused NEW budget rolls into
+      # REFRESH, so the run never idles once history has drained.
+      - key: SEMANTIC_LINK_REFRESH_SHARE
+        sync: false
+      # Max posts taken from any ONE blog per refresh lane, so a 900-post blog
+      # cannot monopolise a batch. Default 3.
+      - key: SEMANTIC_LINK_REFRESH_PER_BLOG
         sync: false
       # Embedding backend: "openai" (default) or "local" (not yet implemented).
       - key: EMBEDDING_MODE
@@ -107,6 +176,89 @@ services:
       - key: DATAFORSEO_PASSWORD
         sync: false
       - key: DATAFORSEO_MAX_RUN_COST
+        sync: false
+      # ── Google Search Console (T04) ──
+      # The service account that owns every client property. EMAIL is the
+      # client_email from the JSON key; PRIVATE_KEY is the PEM with literal \n
+      # escapes (a base64-encoded PEM is also accepted). These belong on the WEB
+      # service only — cron services just curl this service (cron/invoke.sh),
+      # so a GSC var set on a cron service has no effect.
+      #
+      # Unset either one and every GSC route no-ops with a 200. That is the
+      # kill switch: no deploy needed to stop the subsystem.
+      - key: GSC_SERVICE_ACCOUNT_EMAIL
+        sync: false
+      - key: GSC_SERVICE_ACCOUNT_PRIVATE_KEY
+        sync: false
+      # Operator inbox for the weekly suppressed-or-unindexed alert. Unset means
+      # the query still runs and returns JSON; no email is sent.
+      - key: GSC_ALERT_EMAIL
+        sync: false
+      - key: GSC_SYNC_CONCURRENCY
+        value: "5"
+      # URL Inspection is capped at 10,000 calls/DAY per Cloud PROJECT across
+      # ALL properties and ALL shards. 900 x 2 shards = 1,800/day = 18% of the
+      # cap. Raise deliberately; see gsc-index-coverage.ts for the arithmetic.
+      - key: GSC_URL_INSPECT_DAILY_BUDGET
+        value: "900"
+      - key: GSC_URL_INSPECT_PER_SITE
+        value: "4"
+      # T03 removal job: delay in ms between live-post writes. Default 250.
+      # Raise it if a Shopify store starts returning 429s.
+      - key: LINK_EXCHANGE_REMOVAL_THROTTLE_MS
+        sync: false
+      # Auto-publish sizing (T08). 36 blogs at concurrency 3 is 12 waves of
+      # at most 35s ~= 420s, leaving ~180s of the route's 600s maxDuration
+      # for in-tick retries and the sweep's own queries. The code default of
+      # 50 needs 595s before any retry and does not fit. Capacity at 36:
+      # 36 x 4 shards x 24h = 3,456 posts/day, well above the ~1,500/day peak
+      # this network is designed for.
+      - key: MAX_BLOGS_PER_CRON_RUN
+        value: "36"
+      # 4 shards x 3 = 12 in-flight publishes = 36 RPM against Anthropic's
+      # 50 and 24 RPM against Google's 60. Do not raise this to buy time —
+      # 4 would put Claude at 48 of 50 RPM with no margin.
+      - key: AUTO_PUBLISH_CONCURRENCY
+        value: "3"
+      # Age at which an in-flight generated_posts row is considered abandoned
+      # and its day slot released (T08). 3x the longest legitimate lifetime.
+      - key: PUBLISH_REAPER_MINUTES
+        value: "30"
+      # ── Post-verification sweep (T18) ─────────────────────────────────
+      # Read by /api/cron/post-verification. These belong on the WEB
+      # service: a cron service's env vars are consumed by curl in the cron
+      # container and never reach the request handler. Anything the handler
+      # needs per-shard travels in CRON_PATH's query string instead.
+      - key: POST_VERIFICATION_CONCURRENCY
+        value: "6"
+      - key: POST_VERIFICATION_LIMIT
+        value: "600"
+      # Stop dispatching new blogs at 240s. Must stay below maxDuration
+      # (300s) which must stay below CRON_MAX_TIME (330s).
+      - key: POST_VERIFICATION_BUDGET_MS
+        value: "240000"
+      - key: POST_VERIFICATION_RETENTION_DAYS
+        value: "30"
+      - key: POST_VERIFICATION_PRUNE_BATCH
+        value: "5000"
+      # Alert thresholds. Coverage is verified/eligible per shard.
+      - key: POST_VERIFICATION_MIN_COVERAGE_PCT
+        value: "90"
+      - key: POST_VERIFICATION_BEHIND_ALERT
+        value: "10"
+      - key: POST_VERIFICATION_SILENT_DAYS
+        value: "14"
+      # Ops inbox for coverage / silent-blog alerts. Unset = log +
+      # activity_log only, no email.
+      - key: ALERT_EMAIL_TO
+        sync: false
+      # ── Indexing (T15) ────────────────────────────────────────────────
+      # Kill switch for all IndexNow traffic. Set to "1" to stop pinging
+      # without a redeploy; skipped pings are still recorded, so the gap stays
+      # visible. Per-blog keys live in blogs.indexnow_key — the old
+      # network-wide INDEXNOW_KEY is no longer read anywhere and should be
+      # DELETED from this service after the backfill runs.
+      - key: INDEXNOW_DISABLED
         sync: false
       - key: CRON_SECRET
         sync: false
@@ -151,21 +303,92 @@ services:
       - key: CRON_MAX_TIME
         value: "360"
 
-  # Post verification — every 6h aligned to PH morning: 02 / 08 / 14 / 20 PH.
+  # ──────────────────────────────────────────────────────────────────────
+  # POST VERIFICATION — 4-way SHARDED, same hash partition as auto-publish
+  # (shardForBlog in src/lib/cron/sharding.ts). Every blog is in exactly one
+  # shard, so no blog is checked twice and none is skipped.
+  #
+  # Every 6h, aligned to PH morning: 02 / 08 / 14 / 20 PH.
   # 02 PH = 18 UTC (prev day), 08 PH = 00 UTC, 14 PH = 06 UTC, 20 PH = 12 UTC.
+  #
+  # Minutes 05/07/09/11 rather than :00 — the four auto-publish shards fire
+  # on the hour and can each run for up to 600s, and semantic-linking runs
+  # at :20. Minutes 5-11 are otherwise unused.
+  #
+  # Capacity (1,500 active blogs, concurrency 6 set on the WEB service):
+  #   375 blogs per shard; ~56s typical, ~190s pessimistic per run.
+  #   Server-side budget 240s < maxDuration 300s < CRON_MAX_TIME 330s.
+  #
+  # CRON_MAX_TIME MUST stay above the route's own budget: cron/invoke.sh
+  # runs curl with retries, and curl treats --max-time expiry as a transient
+  # error, so a too-small value produces OVERLAPPING sweeps instead of one
+  # clean failure. That is what the previous unsharded service did.
+  #
+  # Shard 0 also runs the post_verifications retention prune.
+  # ──────────────────────────────────────────────────────────────────────
   - type: cron
-    name: netgrid-cron-post-verification
+    name: netgrid-cron-post-verification-0
     runtime: docker
-    schedule: "0 0,6,12,18 * * *"
+    schedule: "5 0,6,12,18 * * *"
     dockerfilePath: ./cron/Dockerfile
     dockerContext: ./cron
     envVars:
       - key: CRON_PATH
-        value: /api/cron/post-verification
+        value: /api/cron/post-verification?shard=0&shardCount=4
       - key: APP_URL
         value: https://netgrid-16f6.onrender.com
       - key: CRON_SECRET
         sync: false
+      - key: CRON_MAX_TIME
+        value: "330"
+
+  - type: cron
+    name: netgrid-cron-post-verification-1
+    runtime: docker
+    schedule: "7 0,6,12,18 * * *"
+    dockerfilePath: ./cron/Dockerfile
+    dockerContext: ./cron
+    envVars:
+      - key: CRON_PATH
+        value: /api/cron/post-verification?shard=1&shardCount=4
+      - key: APP_URL
+        value: https://netgrid-16f6.onrender.com
+      - key: CRON_SECRET
+        sync: false
+      - key: CRON_MAX_TIME
+        value: "330"
+
+  - type: cron
+    name: netgrid-cron-post-verification-2
+    runtime: docker
+    schedule: "9 0,6,12,18 * * *"
+    dockerfilePath: ./cron/Dockerfile
+    dockerContext: ./cron
+    envVars:
+      - key: CRON_PATH
+        value: /api/cron/post-verification?shard=2&shardCount=4
+      - key: APP_URL
+        value: https://netgrid-16f6.onrender.com
+      - key: CRON_SECRET
+        sync: false
+      - key: CRON_MAX_TIME
+        value: "330"
+
+  - type: cron
+    name: netgrid-cron-post-verification-3
+    runtime: docker
+    schedule: "11 0,6,12,18 * * *"
+    dockerfilePath: ./cron/Dockerfile
+    dockerContext: ./cron
+    envVars:
+      - key: CRON_PATH
+        value: /api/cron/post-verification?shard=3&shardCount=4
+      - key: APP_URL
+        value: https://netgrid-16f6.onrender.com
+      - key: CRON_SECRET
+        sync: false
+      - key: CRON_MAX_TIME
+        value: "330"
 
   # Monthly reports — 09:00 PH on the 1st of each month.
   # 09:00 PH = 01:00 UTC same day. PDFs land in client inboxes around
@@ -216,8 +439,16 @@ services:
         value: https://netgrid-16f6.onrender.com
       - key: CRON_SECRET
         sync: false
+      # Above the route's maxDuration of 600s, never below: a curl
+      # timeout re-invokes a handler that is still running. See T08.
       - key: CRON_MAX_TIME
-        value: "660"
+        value: "900"
+      # No retries on an hourly publish sweep. The DB guard makes a
+      # re-invocation harmless, but it still burns a 600s function slot
+      # and doubles API pressure; a missed tick is picked up an hour
+      # later by the deferred queue.
+      - key: CRON_RETRY
+        value: "0"
 
   - type: cron
     name: netgrid-cron-auto-publish-1
@@ -232,8 +463,16 @@ services:
         value: https://netgrid-16f6.onrender.com
       - key: CRON_SECRET
         sync: false
+      # Above the route's maxDuration of 600s, never below: a curl
+      # timeout re-invokes a handler that is still running. See T08.
       - key: CRON_MAX_TIME
-        value: "660"
+        value: "900"
+      # No retries on an hourly publish sweep. The DB guard makes a
+      # re-invocation harmless, but it still burns a 600s function slot
+      # and doubles API pressure; a missed tick is picked up an hour
+      # later by the deferred queue.
+      - key: CRON_RETRY
+        value: "0"
 
   - type: cron
     name: netgrid-cron-auto-publish-2
@@ -248,8 +487,16 @@ services:
         value: https://netgrid-16f6.onrender.com
       - key: CRON_SECRET
         sync: false
+      # Above the route's maxDuration of 600s, never below: a curl
+      # timeout re-invokes a handler that is still running. See T08.
       - key: CRON_MAX_TIME
-        value: "660"
+        value: "900"
+      # No retries on an hourly publish sweep. The DB guard makes a
+      # re-invocation harmless, but it still burns a 600s function slot
+      # and doubles API pressure; a missed tick is picked up an hour
+      # later by the deferred queue.
+      - key: CRON_RETRY
+        value: "0"
 
   - type: cron
     name: netgrid-cron-auto-publish-3
@@ -264,8 +511,16 @@ services:
         value: https://netgrid-16f6.onrender.com
       - key: CRON_SECRET
         sync: false
+      # Above the route's maxDuration of 600s, never below: a curl
+      # timeout re-invokes a handler that is still running. See T08.
       - key: CRON_MAX_TIME
-        value: "660"
+        value: "900"
+      # No retries on an hourly publish sweep. The DB guard makes a
+      # re-invocation harmless, but it still burns a 600s function slot
+      # and doubles API pressure; a missed tick is picked up an hour
+      # later by the deferred queue.
+      - key: CRON_RETRY
+        value: "0"
 
   # Schedule: 06:00 PH every Tuesday.
   # 06:00 PH Tue = 22:00 UTC Mon.
@@ -284,57 +539,181 @@ services:
       - key: CRON_SECRET
         sync: false
 
-  # Re-scrape per-client keyword sets (Google Autocomplete) so the keywords
-  # bound to content generation stay fresh. Weekly, 03:00 UTC Monday — off-peak
-  # and staggered from the news refresh.
+  # ──────────────────────────────────────────────────────────────────────
+  # Keyword refresh — 4-way SHARDED, hourly, STAGGERED.
+  #
+  # Each client's UUID is hashed and assigned to one shard (shardForBlog in
+  # src/lib/cron/sharding.ts — same SHA1 bytes 8-15 the auto-publish crons
+  # have always used), so the four services are disjoint.
+  #
+  # Unlike auto-publish, the four run at DIFFERENT minutes (:07/:22/:37/:52).
+  # They all scrape the same Google endpoint from the same Render egress IP,
+  # so firing them together would multiply the peak request rate by four —
+  # the fastest way to get the source blocked. Staggered, only one shard is
+  # ever scraping.
+  #
+  # Cadence is enforced in SQL, not by the cron schedule: a client is a
+  # candidate only once clients.keywords_refresh_attempted_at is older than
+  # KEYWORD_REFRESH_MIN_AGE_HOURS (default 144 h = 6 days). Running hourly
+  # therefore does NOT scrape anyone 24x a day — it supplies slots.
+  #
+  #   ~17 s per client (160 requests x ~1.3 locales at concurrency 3)
+  #   -> ~12 clients per 210 s run
+  #   4 shards x 24 runs/day x 12  = ~1,150 client-slots/day
+  #   1,500 clients on a 6-day gate = ~250 needed/day
+  #   -> ~4.6x headroom; a cold start covers the whole network in ~1.5 days.
+  #
+  # Each run is bounded by KEYWORD_REFRESH_TIME_BUDGET_MS (210 s) plus the
+  # ledger rebuild (KEYWORD_REBUILD_TIME_BUDGET_MS, 120 s), so it returns well
+  # inside CRON_MAX_TIME. That matters: cron/invoke.sh runs curl with retries,
+  # and curl treats a timeout as a transient error — the old 5-hour run was
+  # being re-fired up to four times per schedule, each retry starting a fresh
+  # full-network scrape alongside the ones still running.
+  # ──────────────────────────────────────────────────────────────────────
   - type: cron
-    name: netgrid-cron-refresh-keywords
+    name: netgrid-cron-refresh-keywords-0
     runtime: docker
-    schedule: "0 3 * * 1"
+    schedule: "7 * * * *"
     dockerfilePath: ./cron/Dockerfile
     dockerContext: ./cron
     envVars:
       - key: CRON_PATH
-        value: /api/cron/refresh-keywords
+        value: /api/cron/refresh-keywords?shard=0&shardCount=4
       - key: APP_URL
         value: https://netgrid-16f6.onrender.com
       - key: CRON_SECRET
         sync: false
+      - key: CRON_MAX_TIME
+        value: "660"
 
-  # Link exchange: build ABC loops from opt-in same-niche blogs and drip a
-  # small number of cross-site body links into existing posts. Deliberately
-  # low-volume + spread out — daily at 05:40 UTC.
   - type: cron
-    name: netgrid-cron-link-exchange
+    name: netgrid-cron-refresh-keywords-1
     runtime: docker
-    schedule: "40 5 * * *"
+    schedule: "22 * * * *"
     dockerfilePath: ./cron/Dockerfile
     dockerContext: ./cron
     envVars:
       - key: CRON_PATH
-        value: /api/cron/link-exchange?limit=10
+        value: /api/cron/refresh-keywords?shard=1&shardCount=4
       - key: APP_URL
         value: https://netgrid-16f6.onrender.com
       - key: CRON_SECRET
         sync: false
+      - key: CRON_MAX_TIME
+        value: "660"
+
+  - type: cron
+    name: netgrid-cron-refresh-keywords-2
+    runtime: docker
+    schedule: "37 * * * *"
+    dockerfilePath: ./cron/Dockerfile
+    dockerContext: ./cron
+    envVars:
+      - key: CRON_PATH
+        value: /api/cron/refresh-keywords?shard=2&shardCount=4
+      - key: APP_URL
+        value: https://netgrid-16f6.onrender.com
+      - key: CRON_SECRET
+        sync: false
+      - key: CRON_MAX_TIME
+        value: "660"
+
+  - type: cron
+    name: netgrid-cron-refresh-keywords-3
+    runtime: docker
+    schedule: "52 * * * *"
+    dockerfilePath: ./cron/Dockerfile
+    dockerContext: ./cron
+    envVars:
+      - key: CRON_PATH
+        value: /api/cron/refresh-keywords?shard=3&shardCount=4
+      - key: APP_URL
+        value: https://netgrid-16f6.onrender.com
+      - key: CRON_SECRET
+        sync: false
+      - key: CRON_MAX_TIME
+        value: "660"
+
+  # ──────────────────────────────────────────────────────────────────────
+  # T03 — LINK-EXCHANGE REMOVAL. TEMPORARY SERVICE.
+  #
+  # The link-exchange cron (netgrid-cron-link-exchange) was deleted here and
+  # its route now returns 410. This service drains link_exchange_removals:
+  # for each queued published post it fetches the live body, strips any
+  # data-nx-exch link, and pushes the body back.
+  #
+  # Every 10 minutes at limit=50 clears ~7,200 posts/day, so a few thousand
+  # posts drain within hours. Idempotent and restartable — a run that is
+  # killed mid-batch simply resumes from the queue.
+  #
+  # DELETE THIS SERVICE once the queue is empty:
+  #   SELECT count(*) FROM link_exchange_removals
+  #    WHERE status = 'pending' OR (status = 'failed' AND attempts < 5);
+  # It is not a permanent part of the platform.
+  # ──────────────────────────────────────────────────────────────────────
+  - type: cron
+    name: netgrid-cron-link-exchange-removal
+    runtime: docker
+    schedule: "*/10 * * * *"
+    dockerfilePath: ./cron/Dockerfile
+    dockerContext: ./cron
+    envVars:
+      - key: CRON_PATH
+        value: /api/cron/link-exchange-removal?limit=50
+      - key: APP_URL
+        value: https://netgrid-16f6.onrender.com
+      - key: CRON_SECRET
+        sync: false
+      - key: CRON_MAX_TIME
+        value: "660"
 
   # Semantic linking backfill: embed published posts missing a vector, then
-  # inject "Related posts" links into posts not yet linked. New posts are
-  # linked immediately on publish; this drains history in capped batches.
-  # Hourly at :20 so it doesn't collide with the on-the-hour publish crons.
+  # link them in two lanes — never-linked posts, and already-linked posts whose
+  # blog has published something newer (see runSemanticLinkingBackfill).
+  #
+  # New posts are linked immediately on publish now that the hook fires on the
+  # cron path too (T16), so the NEW lane mostly catches hook failures. The
+  # REFRESH lane is what keeps the graph bidirectional over time.
+  #
+  # Every 20 minutes at limit=150: ~214 publishes/day need a first link, and
+  # the rest of the budget goes to refreshing. At :05/:25/:45 it avoids the
+  # on-the-hour publish crons and the :07-:52 keyword shards.
   - type: cron
     name: netgrid-cron-semantic-linking
     runtime: docker
-    schedule: "20 * * * *"
+    schedule: "5,25,45 * * * *"
     dockerfilePath: ./cron/Dockerfile
     dockerContext: ./cron
     envVars:
       - key: CRON_PATH
-        value: /api/cron/semantic-linking?limit=40
+        value: /api/cron/semantic-linking?limit=150
       - key: APP_URL
         value: https://netgrid-16f6.onrender.com
       - key: CRON_SECRET
         sync: false
+
+  # Indexing sweep (T15): submit missing/stale sitemaps to Google Search
+  # Console and re-verify IndexNow key files. Daily at 04:10 UTC — off the
+  # hour so it never overlaps the four auto-publish shards, and clear of the
+  # :05/:25/:45 semantic-linking runs and the :07-:52 keyword shards.
+  #
+  # This sweep is the DURABLE path for sitemap submission; the hook in
+  # createBlog is fire-and-forget and can be cut short when the request ends.
+  - type: cron
+    name: netgrid-cron-index-submit
+    runtime: docker
+    schedule: "10 4 * * *"
+    dockerfilePath: ./cron/Dockerfile
+    dockerContext: ./cron
+    envVars:
+      - key: CRON_PATH
+        value: /api/cron/index-submit?limit=25
+      - key: APP_URL
+        value: https://netgrid-16f6.onrender.com
+      - key: CRON_SECRET
+        sync: false
+      - key: CRON_MAX_TIME
+        value: "660"
 
   # ──────────────────────────────────────────────────────────────────────
   # PIPELINE ALERTS (T22) — every 30 minutes.
@@ -361,3 +740,154 @@ services:
         sync: false
       - key: CRON_MAX_TIME
         value: "180"
+
+  # ──────────────────────────────────────────────────────────────────────
+  # GOOGLE SEARCH CONSOLE — daily performance sync, 4-way SHARDED.
+  #
+  # Sharding works exactly like auto-publish: each cron service encodes its
+  # shard in CRON_PATH, and gscShardForBlog(blog.id, 4) assigns every blog to
+  # exactly one shard forever. The four shards are disjoint, so no property is
+  # ever pulled twice in a tick.
+  #
+  # Capacity: one searchanalytics call + one small upsert per blog, ~0.5-2s,
+  # at concurrency 5.
+  #   1,500 verified blogs / 4 shards =  375 per shard  -> ~200-300s   OK
+  #   3,500 verified blogs / 4 shards =  875 per shard  -> ~500-700s   TIGHT
+  #
+  # At the 3,500-blog target duplicate these blocks to 8 shards and change
+  # shardCount in every CRON_PATH. Nothing else changes.
+  #
+  # Self-healing: candidates are ordered gsc_last_synced_at ASC NULLS FIRST, so
+  # a shard that runs out of time resumes where it stopped instead of
+  # restarting from the top.
+  #
+  # Schedule 04:30 UTC — clear of auto-publish (:00) and semantic-linking (:20).
+  # Search Console publishes new data once a day, so a single daily tick is all
+  # that is useful.
+  #
+  # shard 0 also carries ?verify=1, which retries property provisioning for
+  # blogs that are not verified yet — CSV-imported blogs and WordPress blogs
+  # whose DNS TXT record has since been published.
+  # ──────────────────────────────────────────────────────────────────────
+  - type: cron
+    name: netgrid-cron-gsc-sync-0
+    runtime: docker
+    schedule: "30 4 * * *"
+    dockerfilePath: ./cron/Dockerfile
+    dockerContext: ./cron
+    envVars:
+      - key: CRON_PATH
+        value: /api/cron/gsc-sync?shard=0&shardCount=4&limit=500&verify=1
+      - key: APP_URL
+        value: https://netgrid-16f6.onrender.com
+      - key: CRON_SECRET
+        sync: false
+      - key: CRON_MAX_TIME
+        value: "660"
+
+  - type: cron
+    name: netgrid-cron-gsc-sync-1
+    runtime: docker
+    schedule: "30 4 * * *"
+    dockerfilePath: ./cron/Dockerfile
+    dockerContext: ./cron
+    envVars:
+      - key: CRON_PATH
+        value: /api/cron/gsc-sync?shard=1&shardCount=4&limit=500
+      - key: APP_URL
+        value: https://netgrid-16f6.onrender.com
+      - key: CRON_SECRET
+        sync: false
+      - key: CRON_MAX_TIME
+        value: "660"
+
+  - type: cron
+    name: netgrid-cron-gsc-sync-2
+    runtime: docker
+    schedule: "30 4 * * *"
+    dockerfilePath: ./cron/Dockerfile
+    dockerContext: ./cron
+    envVars:
+      - key: CRON_PATH
+        value: /api/cron/gsc-sync?shard=2&shardCount=4&limit=500
+      - key: APP_URL
+        value: https://netgrid-16f6.onrender.com
+      - key: CRON_SECRET
+        sync: false
+      - key: CRON_MAX_TIME
+        value: "660"
+
+  - type: cron
+    name: netgrid-cron-gsc-sync-3
+    runtime: docker
+    schedule: "30 4 * * *"
+    dockerfilePath: ./cron/Dockerfile
+    dockerContext: ./cron
+    envVars:
+      - key: CRON_PATH
+        value: /api/cron/gsc-sync?shard=3&shardCount=4&limit=500
+      - key: APP_URL
+        value: https://netgrid-16f6.onrender.com
+      - key: CRON_SECRET
+        sync: false
+      - key: CRON_MAX_TIME
+        value: "660"
+
+  # ──────────────────────────────────────────────────────────────────────
+  # URL INSPECTION — 2 shards, 900 inspections each = 1,800/day.
+  #
+  # Google's cap is 10,000/DAY PER CLOUD PROJECT across every property and
+  # every shard. 1,800 is 18% of it. If you add a third shard you are adding
+  # 900 more calls/day to a SHARED budget — check the numbers first.
+  #
+  # 05:10 UTC, after the performance sync so a freshly verified property is
+  # already eligible on the same night.
+  # ──────────────────────────────────────────────────────────────────────
+  - type: cron
+    name: netgrid-cron-gsc-coverage-0
+    runtime: docker
+    schedule: "10 5 * * *"
+    dockerfilePath: ./cron/Dockerfile
+    dockerContext: ./cron
+    envVars:
+      - key: CRON_PATH
+        value: /api/cron/gsc-index-coverage?shard=0&shardCount=2
+      - key: APP_URL
+        value: https://netgrid-16f6.onrender.com
+      - key: CRON_SECRET
+        sync: false
+      - key: CRON_MAX_TIME
+        value: "660"
+
+  - type: cron
+    name: netgrid-cron-gsc-coverage-1
+    runtime: docker
+    schedule: "10 5 * * *"
+    dockerfilePath: ./cron/Dockerfile
+    dockerContext: ./cron
+    envVars:
+      - key: CRON_PATH
+        value: /api/cron/gsc-index-coverage?shard=1&shardCount=2
+      - key: APP_URL
+        value: https://netgrid-16f6.onrender.com
+      - key: CRON_SECRET
+        sync: false
+      - key: CRON_MAX_TIME
+        value: "660"
+
+  # Suppressed-or-unindexed alert — weekly, Monday 06:00 UTC. limit=0 means
+  # "run the alert query and send the email, sync nothing"; the four sync
+  # services above have already run by then.
+  - type: cron
+    name: netgrid-cron-gsc-alert
+    runtime: docker
+    schedule: "0 6 * * 1"
+    dockerfilePath: ./cron/Dockerfile
+    dockerContext: ./cron
+    envVars:
+      - key: CRON_PATH
+        value: /api/cron/gsc-sync?alert=1&limit=0
+      - key: APP_URL
+        value: https://netgrid-16f6.onrender.com
+      - key: CRON_SECRET
+        sync: false

@@ -19,15 +19,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import Link from "next/link";
-
-const WEEKDAY_SHORT = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-
-function formatPostingDays(days: number[] | null | undefined): string | null {
-  if (!days || days.length === 0) return null;
-  return days
-    .map((d) => (d >= 1 && d <= 7 ? WEEKDAY_SHORT[d - 1] : `?${d}`))
-    .join(", ");
-}
+import { formatPostingPlan, normalizePostingPlan } from "@/lib/posting-plan";
 
 function formatDateTime(value: Date | string | null): string {
   if (!value) return "—";
@@ -61,8 +53,7 @@ export default async function PostsPage() {
       verification: postVerifications,
       blogDomain: blogs.domain,
       clientName: clients.name,
-      postingFrequency: blogs.postingFrequency,
-      postingFrequencyDays: blogs.postingFrequencyDays,
+      postingPlan: blogs.postingPlan,
     })
     .from(postVerifications)
     .innerJoin(blogs, eq(postVerifications.blogId, blogs.id))
@@ -165,7 +156,7 @@ export default async function PostsPage() {
               </TableHeader>
               <TableBody>
                 {latestPerBlog.map(
-                  ({ verification, blogDomain, clientName, postingFrequency, postingFrequencyDays }) => (
+                  ({ verification, blogDomain, clientName, postingPlan }) => (
                     <TableRow key={verification.id}>
                       <TableCell>
                         <Link
@@ -182,9 +173,7 @@ export default async function PostsPage() {
                         </Badge>
                       </TableCell>
                       <TableCell className="text-xs text-muted-foreground">
-                        {postingFrequency
-                          ? postingFrequency
-                          : formatPostingDays(postingFrequencyDays) ?? "—"}
+                        {formatPostingPlan(normalizePostingPlan(postingPlan))}
                       </TableCell>
                       <TableCell className="max-w-[240px] truncate">
                         {verification.latestPostTitle || "—"}

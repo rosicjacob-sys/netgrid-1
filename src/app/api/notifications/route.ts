@@ -3,9 +3,11 @@ import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth/config";
 import { db } from "@/lib/db";
 import {
+  blogs,
   messages,
   generatedPosts,
   seoIssues,
+  indexPingEvents,
 } from "@/lib/db/schema";
 import { and, eq, gte, sql } from "drizzle-orm";
 
@@ -38,6 +40,8 @@ export async function GET() {
     offScheduleResult,
     recentFailedPublishes,
     criticalSeoIssues,
+    unscheduledBlogs,
+    recentIndexFailures,
   ] = await Promise.all([
     // Messages from clients that admin hasn't read yet
     db
@@ -83,6 +87,30 @@ export async function GET() {
           sql`${seoIssues.status} IN ('detected', 'queued')`,
         ),
       ),
+    // Active blogs with an empty posting_plan. These can never publish —
+    // the auto-publish cron excludes them from its candidate query — so
+    // this is a hard configuration fault, not a transient state.
+    // Backed by blogs_unscheduled_idx (partial index on the zero plan).
+    db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(blogs)
+      .where(
+        and(
+          eq(blogs.status, "active"),
+          sql`${blogs.postingPlan} = '{0,0,0,0,0,0,0}'::integer[]`,
+        ),
+      ),
+    // Indexing failures in the last 24h. "skipped" is excluded on purpose:
+    // Shopify blogs skip IndexNow by design and must not raise an alert.
+    db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(indexPingEvents)
+      .where(
+        and(
+          eq(indexPingEvents.outcome, "failed"),
+          gte(indexPingEvents.createdAt, dayAgo),
+        ),
+      ),
   ]);
 
   const offScheduleCount = Number(offScheduleResult[0]?.count ?? 0);
@@ -94,6 +122,13 @@ export async function GET() {
       label: "Unread client messages",
       href: "/messages",
       severity: "info",
+    },
+    {
+      type: "unscheduled_blogs",
+      count: unscheduledBlogs[0]?.count ?? 0,
+      label: "Active blogs with no posting plan",
+      href: "/blogs",
+      severity: "critical",
     },
     {
       type: "off_schedule",
@@ -115,6 +150,13 @@ export async function GET() {
       label: "Critical SEO issues",
       href: "/seo/fix-queue",
       severity: "critical",
+    },
+    {
+      type: "indexing_failures",
+      count: recentIndexFailures[0]?.count ?? 0,
+      label: "Indexing failures (24h)",
+      href: "/blogs",
+      severity: "warning",
     },
   ];
 
